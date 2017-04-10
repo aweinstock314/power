@@ -75,12 +75,6 @@ user    0m0.040s
 sys     0m0.008s
 $ python -c 'import sys; sys.stdout.write(\"159a360000000000\".decode(\"hex\"))' | sha256sum
 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe  -
-$ time curl localhost:3000/sha256?mask=$(python -c 'print \"0fff\"+\"00\"*28+\"ff\"*2')\\&goal=$(python -c 'print \"dead\"+\"00\"*28+\"beef\"')
-ee00ad0000000060 has hash 2eadd4a8cf0ea220da5570e0ac7855ffc6e416e09c08e0a7b81fbac0fcaabeef
-
-real    0m9.760s
-user    0m0.020s
-sys     0m0.012s
 $ python
 >>> import requests
 >>> requests.get('http://localhost:3000/sha256', params={'mask': '00'+'ff'*3+'00'*28, 'goal': '00badc0d'+'00'*28}).text
