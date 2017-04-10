@@ -5,8 +5,9 @@ authors = ["Avi Weinstock <aweinstock314@gmail.com>"]
 
 [dependencies]
 byteorder = "1.0.0"
-hyper = "0.10.7"
-rayon = "0.7.0"
+futures = "0.1.13"
+hyper = { git = "https://github.com/hyperium/hyper" }
+rayon = { version="0.7.0", features=["unstable"] }
 rust-crypto = "0.2.36"
 rustc-serialize = "0.3"
 url = "1.4.0"

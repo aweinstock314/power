@@ -1,5 +1,6 @@
 extern crate byteorder;
 extern crate crypto;
+extern crate futures;
 extern crate hyper;
 extern crate rayon;
 extern crate rustc_serialize;
@@ -8,12 +9,14 @@ extern crate url;
 use byteorder::{ByteOrder, LittleEndian};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use hyper::server::{Server, Request, Response};
-use hyper::uri::RequestUri;
+use future::Future;
+use futures::future;
+use hyper::StatusCode;
+use hyper::server::{Service, Request, Response, Http};
 use rayon::current_num_threads;
 use rayon::prelude::*;
 use rustc_serialize::hex::{FromHex, ToHex};
-use std::io::Write;
+use std::fmt::Write;
 use url::Url;
 
 fn proofofwork(mask: &[u8], goal: &[u8]) -> (String, String) {
@@ -37,36 +40,7 @@ fn proofofwork(mask: &[u8], goal: &[u8]) -> (String, String) {
     (0..2u64.pow(63)).into_par_iter().filter_map(|x| f(x)).find_any(|_| true).unwrap()
 }
 
-fn powserver(req: Request, resp: Response) {
-    let base_url = Url::parse("http://foo").unwrap();
-    println!("{:?}", req.uri);
-    println!("{:?}", req.headers);
-    if let RequestUri::AbsolutePath(path) = req.uri {
-        if let Ok(url) = Url::options().base_url(Some(&base_url)).parse(&path) {
-            if url.path() == "/sha256" {
-                let mut mask = None;
-                let mut goal = None;
-                for (k, v) in url.query_pairs() {
-                    if k == "mask" && v.len() == 32*2 {
-                        mask = v.from_hex().ok();
-                    }
-                    if k == "goal" && v.len() == 32*2 {
-                        goal = v.from_hex().ok();
-                    }
-                }
-                println!("{:?} {:?}", mask, goal);
-                if let (Some(mask), Some(goal)) = (mask, goal) {
-                    let mut resp = resp.start().unwrap();
-                    let (x, hash) = proofofwork(&mask, &goal);
-                    println!("sending preimage {}", x);
-                    writeln!(resp, "{} has hash {}", x, hash).unwrap();
-                    resp.end().unwrap();
-                    return;
-                }
-            }
-        }
-    }
-    resp.send("Usage examples:
+const HELP_MSG: &'static str = "Usage examples:
 $ time curl localhost:3000/sha256?mask=$(python -c 'print \"00\"*29+\"ff\"*3')\\&goal=$(python -c 'print \"00\"*29+\"deadbe\"')
 159a360000000000 has hash 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe
 
@@ -83,15 +57,66 @@ u'78a3170000000000 has hash fcbadc0d5856bb6eea467a236218eb5e16017a1636e335e29466
 u'c72b530200000040 has hash 00abcdef83801fd557e1740187560ac4fdc557645e175f5faeb407e54a2d9958\\n'
 
 Intended general usage (more algos will be added later):
-GET /sha256?mask=<some 32 byte hex encoded mask>&goal=<some 32 byte hex encoded goal>
-".as_bytes()).unwrap();
+GET /sha256?mask=<some 32 byte hex encoded mask>&goal=<some 32 byte hex encoded goal>";
+
+struct POWService;
+impl Service for POWService {
+    type Request = Request;
+    type Response = Response;
+    type Error = hyper::Error;
+    type Future = Box<Future<Item=Response, Error=hyper::Error>>;
+
+    fn call(&self, req: Request) -> Self::Future {
+        match req.method() {
+            &hyper::Get => (),
+            _ => return Box::new(future::ok(Response::new().with_status(StatusCode::NotFound))),
+        }
+        match req.path() {
+            "/sha256" => { powserver(req) }
+            _ => Box::new(future::ok(Response::new().with_body(HELP_MSG.as_bytes())))
+        }
+    }
+}
+
+fn fmt_error_to_hyper_error(e: std::fmt::Error) -> hyper::Error {
+    let tmp: std::io::Error = std::io::Error::new(std::io::ErrorKind::Other, e);
+    tmp.into()
+}
+
+fn powserver(req: Request) -> Box<Future<Item=Response, Error=hyper::Error>> {
+    let base_url = Url::parse("http://foo").unwrap();
+    println!("{:?}", req.uri());
+    println!("{:?}", req.headers());
+    if let Ok(url) = Url::options().base_url(Some(&base_url)).parse(&req.uri().as_ref()) {
+        let mut mask = None;
+        let mut goal = None;
+        for (k, v) in url.query_pairs() {
+            if k == "mask" && v.len() == 32*2 {
+                mask = v.from_hex().ok();
+            }
+            if k == "goal" && v.len() == 32*2 {
+                goal = v.from_hex().ok();
+            }
+        }
+        println!("mask: {:?}\ngoal: {:?}", mask.clone().map(|x| x.to_hex()), goal.clone().map(|x| x.to_hex()));
+        if let (Some(mask), Some(goal)) = (mask, goal) {
+            let mut resp = String::new();
+            let (x, hash) = proofofwork(&mask, &goal);
+            println!("sending preimage {}", x);
+            if let Err(e) = writeln!(resp, "{} has hash {}", x, hash) {
+                return Box::new(future::err(fmt_error_to_hyper_error(e)));
+            }
+            return Box::new(future::ok(Response::new().with_body(resp)));
+        }
+    }
+    Box::new(future::ok(Response::new().with_body(HELP_MSG.as_bytes())))
 }
 
 fn main() {
     if let Some(Ok(port)) = std::env::args().nth(1).map(|x| x.parse::<u16>()) {
         println!("current_num_threads: {}", current_num_threads());
-        Server::http(("0.0.0.0", port)).expect("Failed to initialize server")
-            .handle(powserver).expect("Failed to initialize handler");
+        Http::new().bind(&("0.0.0.0".parse::<std::net::IpAddr>().unwrap(), port).into(), || Ok(POWService)).expect("Failed to bind server")
+            .run().expect("Fatal error while running the server");
     } else {
         println!("Expecting the port as the first argument.");
     }
