@@ -1,0 +1,12 @@
+[package]
+name = "power"
+version = "0.1.0"
+authors = ["Avi Weinstock <aweinstock314@gmail.com>"]
+
+[dependencies]
+byteorder = "1.0.0"
+hyper = "0.10.7"
+rayon = "0.7.0"
+rust-crypto = "0.2.36"
+rustc-serialize = "0.3"
+url = "1.4.0"
