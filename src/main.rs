@@ -14,7 +14,7 @@ use crypto::sha2::Sha256;
 use futures::{Future, future, Stream};
 use hyper::StatusCode;
 use hyper::server::{Service, Request, Response, Http};
-use rayon::current_num_threads;
+use rayon::{current_num_threads, RayonFuture};
 use rayon::prelude::*;
 use rustc_serialize::hex::{FromHex, ToHex};
 use std::fmt::Write;
@@ -69,28 +69,34 @@ impl<I: AsyncWrite> AsyncWrite for DetectHUP<I> {
     }
 }
 
-fn proofofwork(mask: &[u8], goal: &[u8], done: Arc<atomic::AtomicBool>) -> (String, String) {
+fn proofofwork(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>) -> RayonFuture<(String, String), hyper::Error> {
     assert_eq!(mask.len(), goal.len());
     assert_eq!(mask.len(), 32);
-    let f = |x: u64| {
-        if done.load(atomic::Ordering::Relaxed) {
-            return None;
-        }
-        let mut tmpinput = [0; 8];
-        let mut tmpoutput = [0; 32];
-        LittleEndian::write_u64(&mut tmpinput, x);
-        // TODO: efficient alphanumeric hashes
-        //if !tmpinput.iter().all(|&c| (c as char).is_alphanumeric()) { return None; }
-        let mut hasher = Sha256::new();
-        hasher.input(&tmpinput);
-        hasher.result(&mut tmpoutput);
-        if mask.iter().zip(goal).zip(tmpoutput.iter()).all(|((&m, &g), o)| (m & o) == (m & g)) {
-            //return Some((std::str::from_utf8(&tmpinput).unwrap().into(), hasher.result_str()));
-            return Some((tmpinput.to_hex(), hasher.result_str()));
-        }
-        None
-    };
-    (0..2u64.pow(63)).into_par_iter().filter_map(|x| f(x)).find_any(|_| true).unwrap()
+    rayon::spawn_future_async(future::lazy(move || {
+        let mask = mask;
+        let mask = &mask[..];
+        let goal = goal;
+        let goal = &goal[..];
+        let f = |x: u64| {
+            if done.load(atomic::Ordering::Relaxed) {
+                return None;
+            }
+            let mut tmpinput = [0; 8];
+            let mut tmpoutput = [0; 32];
+            LittleEndian::write_u64(&mut tmpinput, x);
+            // TODO: efficient alphanumeric hashes
+            //if !tmpinput.iter().all(|&c| (c as char).is_alphanumeric()) { return None; }
+            let mut hasher = Sha256::new();
+            hasher.input(&tmpinput);
+            hasher.result(&mut tmpoutput);
+            if mask.iter().zip(goal).zip(tmpoutput.iter()).all(|((m, g), o)| (m & o) == (m & g)) {
+                //return Some((std::str::from_utf8(&tmpinput).unwrap().into(), hasher.result_str()));
+                return Some((tmpinput.to_hex(), hasher.result_str()));
+            }
+            None
+        };
+        Ok((0..2u64.pow(63)).into_par_iter().filter_map(f).find_any(|_| true).unwrap())
+    }))
 }
 
 const HELP_MSG: &'static str = "Usage examples:
@@ -154,12 +160,13 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>) -> Box<Future<Item=Res
         println!("mask: {:?}\ngoal: {:?}", mask.clone().map(|x| x.to_hex()), goal.clone().map(|x| x.to_hex()));
         if let (Some(mask), Some(goal)) = (mask, goal) {
             let mut resp = String::new();
-            let (x, hash) = proofofwork(&mask, &goal, done.clone());
-            println!("sending preimage {}", x);
-            if let Err(e) = writeln!(resp, "{} has hash {}", x, hash) {
-                return Box::new(future::err(fmt_error_to_hyper_error(e)));
-            }
-            return Box::new(future::ok(Response::new().with_body(resp)));
+            return Box::new(proofofwork(mask, goal, done.clone()).and_then(|(x, hash)| {
+                println!("sending preimage {}", x);
+                if let Err(e) = writeln!(resp, "{} has hash {}", x, hash) {
+                    return Err(fmt_error_to_hyper_error(e));
+                }
+                Ok(Response::new().with_body(resp))
+            }));
         }
     }
     Box::new(future::ok(Response::new().with_body(HELP_MSG.as_bytes())))
