@@ -4,25 +4,78 @@ extern crate futures;
 extern crate hyper;
 extern crate rayon;
 extern crate rustc_serialize;
+extern crate tokio_core;
+extern crate tokio_io;
 extern crate url;
 
 use byteorder::{ByteOrder, LittleEndian};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use future::Future;
-use futures::future;
+use futures::{Future, future, Stream};
 use hyper::StatusCode;
 use hyper::server::{Service, Request, Response, Http};
 use rayon::current_num_threads;
 use rayon::prelude::*;
 use rustc_serialize::hex::{FromHex, ToHex};
 use std::fmt::Write;
+use std::io;
+use std::sync::{Arc, atomic};
+use tokio_core::net::TcpListener;
+use tokio_core::reactor::Core;
+use tokio_io::{AsyncRead, AsyncWrite};
 use url::Url;
 
-fn proofofwork(mask: &[u8], goal: &[u8]) -> (String, String) {
+fn detect_hup<I: AsyncRead + AsyncWrite>(io: I) -> (DetectHUP<I>, futures::sync::oneshot::Receiver<()>) {
+    let (sender, receiver) = futures::sync::oneshot::channel();
+    (DetectHUP { io: io, sender: Some(sender) }, receiver)
+}
+struct DetectHUP<I> {
+    io: I,
+    sender: Option<futures::sync::oneshot::Sender<()>>
+}
+impl<I> DetectHUP<I> {
+    fn abortlogic<T: std::fmt::Debug>(&mut self, x: Result<T, io::Error>) -> Result<T, io::Error> {
+        println!("{:?}", x);
+        if let Err(ref e) = x {
+            println!("e.kind {:?}", e.kind());
+            if e.kind() == io::ErrorKind::ConnectionReset {
+                let _ = self.sender.take().map(|sender| sender.send(()));
+            }
+        }
+        x
+    }
+}
+// TODO: more delegation (all Read+Write+AsyncRead+AsyncWrite methods) for efficiency
+impl<I: AsyncRead> io::Read for DetectHUP<I> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let tmp = self.io.read(buf);
+        self.abortlogic(tmp)
+    }
+}
+impl<I: AsyncRead> AsyncRead for DetectHUP<I> {}
+
+impl<I: AsyncWrite> io::Write for DetectHUP<I> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let tmp = self.io.write(buf);
+        self.abortlogic(tmp)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.io.flush()
+    }
+}
+impl<I: AsyncWrite> AsyncWrite for DetectHUP<I> {
+    fn shutdown(&mut self) -> futures::Poll<(), io::Error> {
+        self.io.shutdown()
+    }
+}
+
+fn proofofwork(mask: &[u8], goal: &[u8], done: Arc<atomic::AtomicBool>) -> (String, String) {
     assert_eq!(mask.len(), goal.len());
     assert_eq!(mask.len(), 32);
     let f = |x: u64| {
+        if done.load(atomic::Ordering::Relaxed) {
+            return None;
+        }
         let mut tmpinput = [0; 8];
         let mut tmpoutput = [0; 32];
         LittleEndian::write_u64(&mut tmpinput, x);
@@ -59,7 +112,7 @@ u'c72b530200000040 has hash 00abcdef83801fd557e1740187560ac4fdc557645e175f5faeb4
 Intended general usage (more algos will be added later):
 GET /sha256?mask=<some 32 byte hex encoded mask>&goal=<some 32 byte hex encoded goal>";
 
-struct POWService;
+struct POWService(Arc<atomic::AtomicBool>);
 impl Service for POWService {
     type Request = Request;
     type Response = Response;
@@ -72,7 +125,7 @@ impl Service for POWService {
             _ => return Box::new(future::ok(Response::new().with_status(StatusCode::NotFound))),
         }
         match req.path() {
-            "/sha256" => { powserver(req) }
+            "/sha256" => { powserver(req, self.0.clone()) }
             _ => Box::new(future::ok(Response::new().with_body(HELP_MSG.as_bytes())))
         }
     }
@@ -83,7 +136,7 @@ fn fmt_error_to_hyper_error(e: std::fmt::Error) -> hyper::Error {
     tmp.into()
 }
 
-fn powserver(req: Request) -> Box<Future<Item=Response, Error=hyper::Error>> {
+fn powserver(req: Request, done: Arc<atomic::AtomicBool>) -> Box<Future<Item=Response, Error=hyper::Error>> {
     let base_url = Url::parse("http://foo").unwrap();
     println!("{:?}", req.uri());
     println!("{:?}", req.headers());
@@ -101,7 +154,7 @@ fn powserver(req: Request) -> Box<Future<Item=Response, Error=hyper::Error>> {
         println!("mask: {:?}\ngoal: {:?}", mask.clone().map(|x| x.to_hex()), goal.clone().map(|x| x.to_hex()));
         if let (Some(mask), Some(goal)) = (mask, goal) {
             let mut resp = String::new();
-            let (x, hash) = proofofwork(&mask, &goal);
+            let (x, hash) = proofofwork(&mask, &goal, done.clone());
             println!("sending preimage {}", x);
             if let Err(e) = writeln!(resp, "{} has hash {}", x, hash) {
                 return Box::new(future::err(fmt_error_to_hyper_error(e)));
@@ -115,8 +168,20 @@ fn powserver(req: Request) -> Box<Future<Item=Response, Error=hyper::Error>> {
 fn main() {
     if let Some(Ok(port)) = std::env::args().nth(1).map(|x| x.parse::<u16>()) {
         println!("current_num_threads: {}", current_num_threads());
-        Http::new().bind(&("0.0.0.0".parse::<std::net::IpAddr>().unwrap(), port).into(), || Ok(POWService)).expect("Failed to bind server")
-            .run().expect("Fatal error while running the server");
+        let bindaddr = ("0.0.0.0".parse::<std::net::IpAddr>().unwrap(), port);
+        /*Http::new().bind(&bindaddr.into(), || Ok(POWService)).expect("Failed to bind server")
+            .run().expect("Fatal error while running the server");*/
+        let http = Http::new();
+        let mut core = Core::new().unwrap();
+        let handle = core.handle();
+        let listener = TcpListener::bind(&bindaddr.into(), &handle).unwrap();
+        core.run(listener.incoming().for_each(|(sock, addr)| {
+            let (sock, hup) = detect_hup(sock);
+            let done = Arc::new(atomic::AtomicBool::new(false));
+            http.bind_connection(&handle, sock, addr, POWService(done.clone()));
+            handle.spawn(hup.and_then(move |()| { done.store(true, atomic::Ordering::Relaxed); Ok(()) }).map_err(|_| ()));
+            Ok(())
+        })).unwrap();
     } else {
         println!("Expecting the port as the first argument.");
     }
