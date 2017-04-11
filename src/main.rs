@@ -112,19 +112,20 @@ fn openssl_sys_sha256(x: [u8; 8]) -> [u8; 32] {
 $ time curl localhost:3000/sha256?mask=$(python -c 'print "00"*29+"ff"*3')\&goal=$(python -c 'print "00"*29+"deadbe"')
 159a360000000000 has hash 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe
 
-real    0m3.771s
-user    0m0.020s
-sys     0m0.004s
+real    0m3.427s
+user    0m0.040s
+sys     0m0.008s
 */
     let mut output = [0; 32];
+    thread_local!(static INIT: () = openssl_sys::init());
+    thread_local!(static MD: *const openssl_sys::EVP_MD = unsafe { openssl_sys::EVP_sha256() });
+    thread_local!(static CTX: *mut openssl_sys::EVP_MD_CTX = unsafe { openssl_sys::EVP_MD_CTX_create() }); // TODO: RAII wrapper
     unsafe {
-        openssl_sys::init();
-        let md = openssl_sys::EVP_sha256();
-        let ctx = openssl_sys::EVP_MD_CTX_create();
-        openssl_sys::EVP_DigestInit_ex(ctx, md, 0 as *mut _);
-        openssl_sys::EVP_DigestUpdate(ctx, x.as_ptr() as *const _, x.len());
-        openssl_sys::EVP_DigestFinal(ctx, output.as_mut_ptr() as *mut _, 0 as *mut _);
-        openssl_sys::EVP_MD_CTX_destroy(ctx);
+        INIT.with(|&()| { MD.with(|&md| { CTX.with(|&ctx| {
+            openssl_sys::EVP_DigestInit_ex(ctx, md, 0 as *mut _);
+            openssl_sys::EVP_DigestUpdate(ctx, x.as_ptr() as *const _, x.len());
+            openssl_sys::EVP_DigestFinal(ctx, output.as_mut_ptr() as *mut _, 0 as *mut _);
+        })})});
     }
     output
 }
@@ -249,6 +250,7 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>) -> Box<Future<Item=Res
 fn main() {
     if let Some(Ok(port)) = std::env::args().nth(1).map(|x| x.parse::<u16>()) {
         println!("current_num_threads: {}", current_num_threads());
+        println!("openssl version info: {:?}", openssl::version::c_flags());
         let bindaddr = ("0.0.0.0".parse::<std::net::IpAddr>().unwrap(), port);
         /*Http::new().bind(&bindaddr.into(), || Ok(POWService)).expect("Failed to bind server")
             .run().expect("Fatal error while running the server");*/
