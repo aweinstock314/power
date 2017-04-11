@@ -10,6 +10,7 @@ hyper = { git = "https://github.com/hyperium/hyper" }
 openssl = "0.9.10"
 openssl-sys = "0.9.10"
 rayon = { version="0.7.0", features=["unstable"] }
+ring = "0.7.4"
 rust-crypto = "0.2.36"
 rustc-serialize = "0.3"
 tokio-core = "0.1.6"

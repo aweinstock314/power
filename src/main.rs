@@ -5,6 +5,7 @@ extern crate hyper;
 extern crate openssl;
 extern crate openssl_sys;
 extern crate rayon;
+extern crate ring;
 extern crate rustc_serialize;
 extern crate tokio_core;
 extern crate tokio_io;
@@ -127,6 +128,22 @@ sys     0m0.004s
     }
     output
 }
+#[allow(dead_code)]
+#[inline(always)]
+fn ring_sha256(x: [u8; 8]) -> [u8; 32] {
+/*
+$ time curl localhost:3000/sha256?mask=$(python -c 'print "00"*29+"ff"*3')\&goal=$(python -c 'print "00"*29+"deadbe"')
+159a360000000000 has hash 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe
+
+real    0m2.133s
+user    0m0.012s
+sys     0m0.008s
+*/
+    use ring::digest;
+    let mut output = [0; 32];
+    output.copy_from_slice(&digest::digest(&digest::SHA256, &x).as_ref()[0..32]);
+    output
+}
 
 fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f: F) -> RayonFuture<(String, String), hyper::Error> where
     F: Fn([u8; 8]) -> [u8; 32] + Send + Sync + 'static {
@@ -217,7 +234,7 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>) -> Box<Future<Item=Res
         println!("mask: {:?}\ngoal: {:?}", mask.clone().map(|x| x.to_hex()), goal.clone().map(|x| x.to_hex()));
         if let (Some(mask), Some(goal)) = (mask, goal) {
             let mut resp = String::new();
-            return Box::new(proofofwork(mask, goal, done.clone(), rustcrypto_sha256).and_then(|(x, hash)| {
+            return Box::new(proofofwork(mask, goal, done.clone(), ring_sha256).and_then(|(x, hash)| {
                 println!("sending preimage {}", x);
                 if let Err(e) = writeln!(resp, "{} has hash {}", x, hash) {
                     return Err(fmt_error_to_hyper_error(e));
