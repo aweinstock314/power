@@ -7,6 +7,8 @@ authors = ["Avi Weinstock <aweinstock314@gmail.com>"]
 byteorder = "1.0.0"
 futures = "0.1.13"
 hyper = { git = "https://github.com/hyperium/hyper" }
+openssl = "0.9.10"
+openssl-sys = "0.9.10"
 rayon = { version="0.7.0", features=["unstable"] }
 rust-crypto = "0.2.36"
 rustc-serialize = "0.3"

@@ -2,6 +2,8 @@ extern crate byteorder;
 extern crate crypto;
 extern crate futures;
 extern crate hyper;
+extern crate openssl;
+extern crate openssl_sys;
 extern crate rayon;
 extern crate rustc_serialize;
 extern crate tokio_core;
@@ -14,8 +16,8 @@ use crypto::sha2::Sha256;
 use futures::{Future, future, Stream};
 use hyper::StatusCode;
 use hyper::server::{Service, Request, Response, Http};
-use rayon::{current_num_threads, RayonFuture};
 use rayon::prelude::*;
+use rayon::{current_num_threads, RayonFuture};
 use rustc_serialize::hex::{FromHex, ToHex};
 use std::fmt::Write;
 use std::io;
@@ -69,7 +71,65 @@ impl<I: AsyncWrite> AsyncWrite for DetectHUP<I> {
     }
 }
 
-fn proofofwork(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>) -> RayonFuture<(String, String), hyper::Error> {
+#[allow(dead_code)]
+#[inline(always)]
+fn rustcrypto_sha256(x: [u8; 8]) -> [u8; 32] {
+/*
+$ time curl localhost:3000/sha256?mask=$(python -c 'print "00"*29+"ff"*3')\&goal=$(python -c 'print "00"*29+"deadbe"')
+159a360000000000 has hash 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe
+
+real    0m3.056s
+user    0m0.032s
+sys     0m0.004s
+*/
+    let mut tmpoutput = [0; 32];
+    let mut hasher = Sha256::new();
+    hasher.input(&x);
+    hasher.result(&mut tmpoutput);
+    tmpoutput
+}
+#[allow(dead_code)]
+#[inline(always)]
+fn openssl_sha256(x: [u8; 8]) -> [u8; 32] {
+/*
+$ time curl localhost:3000/sha256?mask=$(python -c 'print "00"*29+"ff"*3')\&goal=$(python -c 'print "00"*29+"deadbe"')
+159a360000000000 has hash 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe
+
+real    0m4.046s
+user    0m0.036s
+sys     0m0.016s
+*/
+    use openssl::hash::{hash, MessageDigest};
+    let mut output = [0; 32];
+    output.copy_from_slice(&hash(MessageDigest::sha256(), &x).unwrap()[0..32]);
+    output
+}
+#[allow(dead_code)]
+#[inline(always)]
+fn openssl_sys_sha256(x: [u8; 8]) -> [u8; 32] {
+/*
+$ time curl localhost:3000/sha256?mask=$(python -c 'print "00"*29+"ff"*3')\&goal=$(python -c 'print "00"*29+"deadbe"')
+159a360000000000 has hash 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe
+
+real    0m3.771s
+user    0m0.020s
+sys     0m0.004s
+*/
+    let mut output = [0; 32];
+    unsafe {
+        openssl_sys::init();
+        let md = openssl_sys::EVP_sha256();
+        let ctx = openssl_sys::EVP_MD_CTX_create();
+        openssl_sys::EVP_DigestInit_ex(ctx, md, 0 as *mut _);
+        openssl_sys::EVP_DigestUpdate(ctx, x.as_ptr() as *const _, x.len());
+        openssl_sys::EVP_DigestFinal(ctx, output.as_mut_ptr() as *mut _, 0 as *mut _);
+        openssl_sys::EVP_MD_CTX_destroy(ctx);
+    }
+    output
+}
+
+fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f: F) -> RayonFuture<(String, String), hyper::Error> where
+    F: Fn([u8; 8]) -> [u8; 32] + Send + Sync + 'static {
     assert_eq!(mask.len(), goal.len());
     assert_eq!(mask.len(), 32);
     rayon::spawn_future_async(future::lazy(move || {
@@ -82,16 +142,13 @@ fn proofofwork(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>) -> R
                 return None;
             }
             let mut tmpinput = [0; 8];
-            let mut tmpoutput = [0; 32];
             LittleEndian::write_u64(&mut tmpinput, x);
             // TODO: efficient alphanumeric hashes
             //if !tmpinput.iter().all(|&c| (c as char).is_alphanumeric()) { return None; }
-            let mut hasher = Sha256::new();
-            hasher.input(&tmpinput);
-            hasher.result(&mut tmpoutput);
+            let tmpoutput = f(tmpinput);
             if mask.iter().zip(goal).zip(tmpoutput.iter()).all(|((m, g), o)| (m & o) == (m & g)) {
                 //return Some((std::str::from_utf8(&tmpinput).unwrap().into(), hasher.result_str()));
-                return Some((tmpinput.to_hex(), hasher.result_str()));
+                return Some((tmpinput.to_hex(), f(tmpinput).to_hex()));
             }
             None
         };
@@ -160,7 +217,7 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>) -> Box<Future<Item=Res
         println!("mask: {:?}\ngoal: {:?}", mask.clone().map(|x| x.to_hex()), goal.clone().map(|x| x.to_hex()));
         if let (Some(mask), Some(goal)) = (mask, goal) {
             let mut resp = String::new();
-            return Box::new(proofofwork(mask, goal, done.clone()).and_then(|(x, hash)| {
+            return Box::new(proofofwork(mask, goal, done.clone(), rustcrypto_sha256).and_then(|(x, hash)| {
                 println!("sending preimage {}", x);
                 if let Err(e) = writeln!(resp, "{} has hash {}", x, hash) {
                     return Err(fmt_error_to_hyper_error(e));
