@@ -9,6 +9,7 @@ extern crate ring;
 extern crate rustc_serialize;
 extern crate tokio_core;
 extern crate tokio_io;
+extern crate tokio_proto;
 extern crate url;
 
 use byteorder::{ByteOrder, LittleEndian};
@@ -69,6 +70,57 @@ impl<I: AsyncWrite> io::Write for DetectHUP<I> {
 impl<I: AsyncWrite> AsyncWrite for DetectHUP<I> {
     fn shutdown(&mut self) -> futures::Poll<(), io::Error> {
         self.io.shutdown()
+    }
+}
+
+struct InjectZeroLengthReads<P>(P, Duration);
+impl<B: AsRef<[u8]>+'static> InjectZeroLengthReads<Http<B>> {
+    fn bind_connection<S, I, Bd>(&self, handle: &Handle, io: I, remote_service: std::net::SocketAddr, service: S) where
+        S: Service<Request=Request, Response=Response<Bd>, Error=hyper::Error> + 'static,
+        Bd: Stream<Item=B, Error=hyper::Error> + 'static,
+        I: AsyncRead + AsyncWrite + 'static {
+        println!("IZLR bind_connection");
+        self.0.bind_connection(handle, io, remote_service, service)
+    }
+}
+impl<T: 'static, P: tokio_proto::pipeline::ServerProto<T>> tokio_proto::pipeline::ServerProto<T> for InjectZeroLengthReads<P> where
+    P::Request: std::fmt::Debug,
+    P::Response: std::fmt::Debug {
+    type Request = P::Request;
+    type Response = P::Response;
+    type Transport = IZLRTransport<T, P>;
+    type BindTransport = Box<Future<Item=Self::Transport, Error=io::Error>>;
+    fn bind_transport(&self, io: T) -> Self::BindTransport {
+        use futures::IntoFuture;
+        println!("IZLR bind_transport");
+        Box::new(self.0.bind_transport(io).into_future().map(IZLRTransport))
+    }
+}
+struct IZLRTransport<T: 'static, P: tokio_proto::pipeline::ServerProto<T>>(P::Transport);
+impl<T, P: tokio_proto::pipeline::ServerProto<T>> Stream for IZLRTransport<T, P> where
+    P::Request: std::fmt::Debug {
+    type Item = P::Request;
+    type Error = io::Error;
+    fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
+        let tmp = self.0.poll();
+        println!("IZLRTransport::poll {:?}", tmp);
+        tmp
+    }
+}
+
+impl<T, P: tokio_proto::pipeline::ServerProto<T>> Sink for IZLRTransport<T, P> where
+    P::Response: std::fmt::Debug {
+    type SinkItem = P::Response;
+    type SinkError = io::Error;
+    fn start_send(&mut self, item: Self::SinkItem) -> futures::StartSend<Self::SinkItem, Self::SinkError> {
+        let tmp = self.0.start_send(item);
+        println!("IZLRTransport::start_send {:?}", tmp);
+        tmp
+    }
+    fn poll_complete(&mut self) -> futures::Poll<(), Self::SinkError> {
+        let tmp = self.0.poll_complete();
+        println!("IZLRTransport::poll_complete {:?}", tmp);
+        tmp
     }
 }
 
@@ -284,13 +336,14 @@ fn main() {
         let bindaddr = ("0.0.0.0".parse::<std::net::IpAddr>().unwrap(), port);
         /*Http::new().bind(&bindaddr.into(), || Ok(POWService)).expect("Failed to bind server")
             .run().expect("Fatal error while running the server");*/
-        let http = Http::new();
         let mut core = Core::new().unwrap();
         let handle = core.handle();
         let listener = TcpListener::bind(&bindaddr.into(), &handle).unwrap();
         core.run(listener.incoming().for_each(|(sock, addr)| {
+            let http = Http::new();
             let (sock, hup) = detect_hup(sock);
             let done = Arc::new(atomic::AtomicBool::new(false));
+            let http = InjectZeroLengthReads(http, Duration::from_secs(1));
             http.bind_connection(&handle, sock, addr, POWService(done.clone(), handle.clone()));
             handle.spawn(hup.and_then(move |()| { done.store(true, atomic::Ordering::Relaxed); Ok(()) }).map_err(|_| ()));
             Ok(())
