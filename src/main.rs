@@ -150,6 +150,9 @@ fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f
     F: Fn([u8; 8]) -> [u8; 32] + Send + Sync + 'static {
     assert_eq!(mask.len(), goal.len());
     assert_eq!(mask.len(), 32);
+    let mut shift = [0; 8];
+    let _ = ring::rand::SystemRandom::new().fill(&mut shift[..]);
+    let shift = LittleEndian::read_u64(&shift);
     rayon::spawn_future_async(future::lazy(move || {
         let mask = mask;
         let mask = &mask[..];
@@ -170,7 +173,7 @@ fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f
             }
             None
         };
-        Ok((0..2u64.pow(63)).into_par_iter().filter_map(f).find_any(|_| true).unwrap())
+        Ok((0..(0u64.wrapping_sub(1))).into_par_iter().map(|x| x.wrapping_add(shift)).filter_map(f).find_any(|_| true).unwrap())
     }))
 }
 
