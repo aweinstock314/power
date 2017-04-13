@@ -42,7 +42,7 @@ impl<I> DetectHUP<I> {
         println!("{:?}", x);
         if let Err(ref e) = x {
             println!("e.kind {:?}", e.kind());
-            if e.kind() == io::ErrorKind::ConnectionReset {
+            if e.kind() == io::ErrorKind::BrokenPipe {
                 let _ = self.sender.take().map(|sender| sender.send(()));
             }
         }
@@ -73,7 +73,7 @@ impl<I: AsyncWrite> AsyncWrite for DetectHUP<I> {
     }
 }
 
-struct InjectZeroLengthReads<P>(P, Duration);
+/*struct InjectZeroLengthReads<P>(P, Duration);
 impl<B: AsRef<[u8]>+'static> InjectZeroLengthReads<Http<B>> {
     fn bind_connection<S, I, Bd>(&self, handle: &Handle, io: I, remote_service: std::net::SocketAddr, service: S) where
         S: Service<Request=Request, Response=Response<Bd>, Error=hyper::Error> + 'static,
@@ -122,7 +122,7 @@ impl<T, P: tokio_proto::pipeline::ServerProto<T>> Sink for IZLRTransport<T, P> w
         println!("IZLRTransport::poll_complete {:?}", tmp);
         tmp
     }
-}
+}*/
 
 #[allow(dead_code)]
 #[inline(always)]
@@ -274,6 +274,52 @@ fn to_hyper_error<E: std::error::Error+Send+Sync+'static>(e: E) -> hyper::Error 
     std::io::Error::new(std::io::ErrorKind::Other, e).into()
 }
 
+enum Interleave<F, S> {
+    Nil,
+    FutureStep(F, S),
+    StreamStep(F, S),
+    StreamExhausted(F),
+}
+impl<F,S,T,E> Future for Interleave<F, S> where
+    T: std::fmt::Debug, E: std::fmt::Debug,
+    F: Future<Item=T, Error=E>,
+    S: Stream<Item=(), Error=E> {
+    type Item = T;
+    type Error = E;
+    fn poll(&mut self) -> futures::Poll<T, E> {
+        use futures::Async::*;
+        use Interleave::*;
+        let state = std::mem::replace(self, Nil);
+        println!("Interleave::poll({})", match state {
+            Nil => "Nil",
+            FutureStep(_, _) => "FutureStep",
+            StreamStep(_, _) => "StreamStep",
+            StreamExhausted(_) => "StreamExhausted",
+        });
+        let tmp = match state {
+            Nil => panic!("Attempted to poll interleave while Nil"),
+            FutureStep(mut f, s) => match f.poll() {
+                Ok(Ready(t)) => Ok(Ready(t)),
+                Ok(NotReady) => { *self = StreamStep(f, s); Ok(NotReady) },
+                Err(e) => Err(e),
+            },
+            StreamStep(f, mut s) => match s.poll() {
+                Ok(Ready(Some(()))) => { *self = FutureStep(f, s); Ok(NotReady) },
+                Ok(Ready(None)) => { *self = StreamExhausted(f); Ok(NotReady) },
+                Ok(NotReady) => { *self = StreamStep(f, s); Ok(NotReady) },
+                Err(e) => Err(e),
+            },
+            StreamExhausted(mut f) => match f.poll() {
+                Ok(Ready(t)) => Ok(Ready(t)),
+                Ok(NotReady) => { *self = StreamExhausted(f); Ok(NotReady) },
+                Err(e) => Err(e),
+            },
+        };
+        println!("returning {:?}", tmp);
+        tmp
+    }
+}
+
 fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Box<Future<Item=Response, Error=hyper::Error>> {
     let base_url = Url::parse("http://foo").unwrap();
     println!("{:?}", req.uri());
@@ -295,7 +341,7 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
             let (send, recv) = futures::sync::mpsc::channel(10);
             let body: hyper::Body = recv.into();
             let resp = Response::new().with_body(body);
-            let timer = match Timeout::new(Duration::from_secs(5), handle).map_err(to_hyper_error) {
+            let timer = match Timeout::new(Duration::from_secs(1), handle).map_err(to_hyper_error) {
                 Ok(timer) => timer,
                 Err(e) => return Box::new(future::err(to_hyper_error(e))),
             };
@@ -306,11 +352,19 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
                         return None;
                     }
                     println!("progress ping");
-                    Some(timer.map_err(to_hyper_error).and_then(|()| { send.send(Ok("x".into())).map_err(to_hyper_error).and_then(|send| {
-                        println!("inside future");
-                        let timer = Timeout::new(Duration::from_secs(1), &handle).map_err(to_hyper_error)?;
-                        Ok(((), (send, timer, handle)))
-                    })}))
+                    let nextiter = timer.map_err(to_hyper_error).and_then(|()| {
+                        let sent = send.send(Ok("x".into())).map_err(to_hyper_error);
+                        let flushed = sent.and_then(|send| {
+                            println!("sent");
+                            send.flush().map_err(to_hyper_error)
+                        });
+                        flushed.and_then(|send| {
+                            println!("flushed");
+                            let timer = Timeout::new(Duration::from_secs(1), &handle).map_err(to_hyper_error)?;
+                            Ok(((), (send, timer, handle)))
+                        })
+                    });
+                    Some(nextiter)
                 })
             };
             let pow = proofofwork(mask, goal, done.clone(), ring_sha256).and_then(move |opt| {
@@ -322,7 +376,8 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
                 }.map(|_| ()).map_err(to_hyper_error)
             });
             //handle.spawn(progressindicator.for_each(|()| Ok(())).map_err(|_| ()));
-            handle.spawn(pow.map_err(|_| ()));
+            //handle.spawn(pow.map_err(|_| ()));
+            handle.spawn(Interleave::StreamStep(pow, progressindicator).map_err(|_| ()));
             return Box::new(future::ok(resp));
         }
     }
@@ -343,9 +398,13 @@ fn main() {
             let http = Http::new();
             let (sock, hup) = detect_hup(sock);
             let done = Arc::new(atomic::AtomicBool::new(false));
-            let http = InjectZeroLengthReads(http, Duration::from_secs(1));
+            //let http = InjectZeroLengthReads(http, Duration::from_secs(1));
             http.bind_connection(&handle, sock, addr, POWService(done.clone(), handle.clone()));
-            handle.spawn(hup.and_then(move |()| { done.store(true, atomic::Ordering::Relaxed); Ok(()) }).map_err(|_| ()));
+            handle.spawn(hup.and_then(move |()| {
+                println!("detected HUP");
+                done.store(true, atomic::Ordering::Relaxed);
+                Ok(())
+            }).map_err(|_| ()));
             Ok(())
         })).unwrap();
     } else {
