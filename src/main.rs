@@ -198,19 +198,21 @@ sys     0m0.008s
     output
 }
 
-fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f: F) -> RayonFuture<Option<(String, String)>, hyper::Error> where
+fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f: F) -> futures::sync::mpsc::Receiver<Option<(String, String)>> where
     F: Fn([u8; 8]) -> [u8; 32] + Send + Sync + 'static {
     assert_eq!(mask.len(), goal.len());
     assert_eq!(mask.len(), 32);
     let mut shift = [0; 8];
     let _ = ring::rand::SystemRandom::new().fill(&mut shift[..]);
     let shift = LittleEndian::read_u64(&shift);
-    rayon::spawn_future_async(future::lazy(move || {
+    let (send, recv) = futures::sync::mpsc::channel(10);
+    let fut = rayon::spawn_future_async(future::lazy(move || {
         let mask = mask;
         let mask = &mask[..];
         let goal = goal;
         let goal = &goal[..];
         let attempt_hash = |x: u64| {
+            //println!("hashing {}", x);
             let mut tmpinput = [0; 8];
             LittleEndian::write_u64(&mut tmpinput, x);
             // TODO: efficient alphanumeric hashes
@@ -222,14 +224,18 @@ fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f
             }
             None
         };
-        let result = Ok((0..(0u64.wrapping_sub(1))).into_par_iter() // Brute force over a 64-bit input space
+        println!("in rayon threadpool, pre loop");
+        let result = (0..(0u64.wrapping_sub(1))).into_par_iter() // Brute force over a 64-bit input space
             .map(|x| x.wrapping_add(shift)) // Randomize the starting space
             .map(attempt_hash) // calculate the hashes
-            .find_any(|x| x.is_some() || done.load(atomic::Ordering::Relaxed)) // abort early if we're done (i.e. client cancelled)
-            .and_then(|x| x)); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
+            .find_any(|x| (x.is_some() || done.load(atomic::Ordering::Relaxed)) && { println!("testing"); true }) // abort early if we're done (i.e. client cancelled)
+            .and_then(|x| x); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
         done.store(true, atomic::Ordering::Relaxed);
-        result
-    }))
+        println!("done in rayon threadpool");
+        send.send(result)
+    }));
+    rayon::spawn_async(move || { let _ = fut.rayon_wait(); });
+    recv
 }
 
 const HELP_MSG: &'static str = "Usage examples:
@@ -276,8 +282,7 @@ fn to_hyper_error<E: std::error::Error+Send+Sync+'static>(e: E) -> hyper::Error 
 
 enum Interleave<F, S> {
     Nil,
-    FutureStep(F, S),
-    StreamStep(F, S),
+    Step(F, S),
     StreamExhausted(F),
 }
 impl<F,S,T,E> Future for Interleave<F, S> where
@@ -292,22 +297,18 @@ impl<F,S,T,E> Future for Interleave<F, S> where
         let state = std::mem::replace(self, Nil);
         println!("Interleave::poll({})", match state {
             Nil => "Nil",
-            FutureStep(_, _) => "FutureStep",
-            StreamStep(_, _) => "StreamStep",
+            Step(_, _) => "Step",
             StreamExhausted(_) => "StreamExhausted",
         });
         let tmp = match state {
             Nil => panic!("Attempted to poll interleave while Nil"),
-            FutureStep(mut f, s) => match f.poll() {
-                Ok(Ready(t)) => Ok(Ready(t)),
-                Ok(NotReady) => { *self = StreamStep(f, s); Ok(NotReady) },
-                Err(e) => Err(e),
-            },
-            StreamStep(f, mut s) => match s.poll() {
-                Ok(Ready(Some(()))) => { *self = FutureStep(f, s); Ok(NotReady) },
-                Ok(Ready(None)) => { *self = StreamExhausted(f); Ok(NotReady) },
-                Ok(NotReady) => { *self = StreamStep(f, s); Ok(NotReady) },
-                Err(e) => Err(e),
+            Step(mut f, mut s) => match (f.poll(), s.poll()) {
+                (Ok(Ready(t)), _) => Ok(Ready(t)),
+                (_, Ok(Ready(None))) => { *self = StreamExhausted(f); Ok(NotReady) },
+                (_, Ok(Ready(Some(())))) => { *self = Step(f, s); Ok(NotReady) },
+                (Ok(NotReady), Ok(NotReady)) => { *self = Step(f, s); Ok(NotReady) },
+                (Err(e), _) => Err(e),
+                (_, Err(e)) => Err(e),
             },
             StreamExhausted(mut f) => match f.poll() {
                 Ok(Ready(t)) => Ok(Ready(t)),
@@ -367,7 +368,9 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
                     Some(nextiter)
                 })
             };
-            let pow = proofofwork(mask, goal, done.clone(), ring_sha256).and_then(move |opt| {
+            //let pow = proofofwork(mask, goal, done.clone(), ring_sha256).map_err(to_hyper_error);
+            let pow = proofofwork(mask, goal, done.clone(), ring_sha256).map_err(|()| to_hyper_error(io::Error::from(io::ErrorKind::Other))).into_future().map(|(a,_)| a.unwrap()).map_err(|(a,_)| a);
+            let pow = pow.and_then(move |opt| {
                 if let Some((x, hash)) = opt {
                     println!("sending preimage {}", x);
                     send.send(Ok(format!("{} has hash {}", x, hash).into()))
@@ -377,7 +380,8 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
             });
             //handle.spawn(progressindicator.for_each(|()| Ok(())).map_err(|_| ()));
             //handle.spawn(pow.map_err(|_| ()));
-            handle.spawn(Interleave::StreamStep(pow, progressindicator).map_err(|_| ()));
+            handle.spawn(pow.select(progressindicator.for_each(|()| Ok(()))).map(|_| ()).map_err(|_| ()));
+            //handle.spawn(Interleave::Step(pow, progressindicator).map_err(|_| ()));
             return Box::new(future::ok(resp));
         }
     }

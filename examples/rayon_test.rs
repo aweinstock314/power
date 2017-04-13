@@ -36,7 +36,8 @@ fn working() {
 
 fn main() {
     // strangely, "buggy" seems to work correctly if "working" is run first, but has the 50% behavior if "working" is commented out, or if the order is swapped. maybe it's an initialization thing?
-    working();
+    rayon::initialize(rayon::Configuration::new()).unwrap(); // this doesn't seem to help though
+    //working();
     println!("-----");
     buggy();
 }
