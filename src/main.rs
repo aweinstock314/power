@@ -198,15 +198,15 @@ sys     0m0.008s
     output
 }
 
-fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f: F) -> futures::sync::mpsc::Receiver<Option<(String, String)>> where
+fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f: F) -> futures::sync::oneshot::Receiver<Option<(String, String)>> where
     F: Fn([u8; 8]) -> [u8; 32] + Send + Sync + 'static {
     assert_eq!(mask.len(), goal.len());
     assert_eq!(mask.len(), 32);
     let mut shift = [0; 8];
     let _ = ring::rand::SystemRandom::new().fill(&mut shift[..]);
     let shift = LittleEndian::read_u64(&shift);
-    let (send, recv) = futures::sync::mpsc::channel(10);
-    let fut = rayon::spawn_future_async(future::lazy(move || {
+    let (send, recv) = futures::sync::oneshot::channel();
+    rayon::spawn_async(move || {
         let mask = mask;
         let mask = &mask[..];
         let goal = goal;
@@ -229,12 +229,11 @@ fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f
             .map(|x| x.wrapping_add(shift)) // Randomize the starting space
             .map(attempt_hash) // calculate the hashes
             .find_any(|x| (x.is_some() || done.load(atomic::Ordering::Relaxed)) && { println!("testing"); true }) // abort early if we're done (i.e. client cancelled)
-            .and_then(|x| x); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
-        done.store(true, atomic::Ordering::Relaxed);
+            .and_then(|x| { done.store(true, atomic::Ordering::Relaxed); println!("testing2"); x }); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
         println!("done in rayon threadpool");
-        send.send(result)
-    }));
-    rayon::spawn_async(move || { let _ = fut.rayon_wait(); });
+        let _ = send.send(result);
+        println!("foo2");
+    });
     recv
 }
 
@@ -368,8 +367,8 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
                     Some(nextiter)
                 })
             };
-            //let pow = proofofwork(mask, goal, done.clone(), ring_sha256).map_err(to_hyper_error);
-            let pow = proofofwork(mask, goal, done.clone(), ring_sha256).map_err(|()| to_hyper_error(io::Error::from(io::ErrorKind::Other))).into_future().map(|(a,_)| a.unwrap()).map_err(|(a,_)| a);
+            let pow = proofofwork(mask, goal, done.clone(), ring_sha256).map_err(to_hyper_error);
+            //let pow = proofofwork(mask, goal, done.clone(), ring_sha256).map_err(|()| to_hyper_error(io::Error::from(io::ErrorKind::Other))).into_future().map(|(a,_)| a.unwrap()).map_err(|(a,_)| a);
             let pow = pow.and_then(move |opt| {
                 if let Some((x, hash)) = opt {
                     println!("sending preimage {}", x);
