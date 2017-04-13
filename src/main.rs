@@ -19,7 +19,6 @@ use futures::{Future, future, Stream, stream, Sink};
 use hyper::StatusCode;
 use hyper::server::{Service, Request, Response, Http};
 use rayon::prelude::*;
-use rayon::{current_num_threads, RayonFuture};
 use rustc_serialize::hex::{FromHex, ToHex};
 use std::io;
 use std::sync::{Arc, atomic};
@@ -39,7 +38,7 @@ struct DetectHUP<I> {
 }
 impl<I> DetectHUP<I> {
     fn abortlogic<T: std::fmt::Debug>(&mut self, x: Result<T, io::Error>) -> Result<T, io::Error> {
-        println!("{:?}", x);
+        //println!("{:?}", x);
         if let Err(ref e) = x {
             println!("e.kind {:?}", e.kind());
             if e.kind() == io::ErrorKind::BrokenPipe {
@@ -212,7 +211,6 @@ fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f
         let goal = goal;
         let goal = &goal[..];
         let attempt_hash = |x: u64| {
-            //println!("hashing {}", x);
             let mut tmpinput = [0; 8];
             LittleEndian::write_u64(&mut tmpinput, x);
             // TODO: efficient alphanumeric hashes
@@ -224,15 +222,13 @@ fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f
             }
             None
         };
-        println!("in rayon threadpool, pre loop");
         let result = (0..(0u64.wrapping_sub(1))).into_par_iter() // Brute force over a 64-bit input space
             .map(|x| x.wrapping_add(shift)) // Randomize the starting space
             .map(attempt_hash) // calculate the hashes
-            .find_any(|x| (x.is_some() || done.load(atomic::Ordering::Relaxed)) && { println!("testing"); true }) // abort early if we're done (i.e. client cancelled)
-            .and_then(|x| { done.store(true, atomic::Ordering::Relaxed); println!("testing2"); x }); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
-        println!("done in rayon threadpool");
+            .find_any(|x| (x.is_some() || done.load(atomic::Ordering::Relaxed))) // abort early if we're done (i.e. client cancelled)
+            .and_then(|x| x); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
+        done.store(true, atomic::Ordering::Relaxed);
         let _ = send.send(result);
-        println!("foo2");
     });
     recv
 }
@@ -279,7 +275,7 @@ fn to_hyper_error<E: std::error::Error+Send+Sync+'static>(e: E) -> hyper::Error 
     std::io::Error::new(std::io::ErrorKind::Other, e).into()
 }
 
-enum Interleave<F, S> {
+/*enum Interleave<F, S> {
     Nil,
     Step(F, S),
     StreamExhausted(F),
@@ -318,7 +314,7 @@ impl<F,S,T,E> Future for Interleave<F, S> where
         println!("returning {:?}", tmp);
         tmp
     }
-}
+}*/
 
 fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Box<Future<Item=Response, Error=hyper::Error>> {
     let base_url = Url::parse("http://foo").unwrap();
@@ -337,7 +333,6 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
         }
         println!("mask: {:?}\ngoal: {:?}", mask.clone().map(|x| x.to_hex()), goal.clone().map(|x| x.to_hex()));
         if let (Some(mask), Some(goal)) = (mask, goal) {
-            //done.store(true, atomic::Ordering::Relaxed);
             let (send, recv) = futures::sync::mpsc::channel(10);
             let body: hyper::Body = recv.into();
             let resp = Response::new().with_body(body);
@@ -349,17 +344,13 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
                 let done = done.clone();
                 stream::unfold((send.clone(), timer, handle.clone()), move |(send, timer, handle)| {
                     if done.load(atomic::Ordering::Relaxed) {
+                        println!("progressindicator: done");
                         return None;
                     }
-                    println!("progress ping");
                     let nextiter = timer.map_err(to_hyper_error).and_then(|()| {
                         let sent = send.send(Ok("x".into())).map_err(to_hyper_error);
-                        let flushed = sent.and_then(|send| {
-                            println!("sent");
-                            send.flush().map_err(to_hyper_error)
-                        });
+                        let flushed = sent.and_then(|send| { send.flush().map_err(to_hyper_error) });
                         flushed.and_then(|send| {
-                            println!("flushed");
                             let timer = Timeout::new(Duration::from_secs(1), &handle).map_err(to_hyper_error)?;
                             Ok(((), (send, timer, handle)))
                         })
@@ -367,20 +358,17 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
                     Some(nextiter)
                 })
             };
+            let beginning = send.send(Ok("{\"progressbar\":\"".into()).into()).map_err(to_hyper_error);
             let pow = proofofwork(mask, goal, done.clone(), ring_sha256).map_err(to_hyper_error);
-            //let pow = proofofwork(mask, goal, done.clone(), ring_sha256).map_err(|()| to_hyper_error(io::Error::from(io::ErrorKind::Other))).into_future().map(|(a,_)| a.unwrap()).map_err(|(a,_)| a);
-            let pow = pow.and_then(move |opt| {
+            let pow = beginning.join(pow).and_then(move |(send, opt)| {
                 if let Some((x, hash)) = opt {
                     println!("sending preimage {}", x);
-                    send.send(Ok(format!("{} has hash {}", x, hash).into()))
+                    send.send(Ok(format!("\", \"preimage_hex\":\"{}\", \"image_hex\":\"{}\"}}", x, hash).into()))
                 } else {
-                    send.send(Ok("Cancelled or exhausted search space".into()))
+                    send.send(Ok("\", \"error\":\"Cancelled or exhausted search space\"}".into()))
                 }.map(|_| ()).map_err(to_hyper_error)
             });
-            //handle.spawn(progressindicator.for_each(|()| Ok(())).map_err(|_| ()));
-            //handle.spawn(pow.map_err(|_| ()));
             handle.spawn(pow.select(progressindicator.for_each(|()| Ok(()))).map(|_| ()).map_err(|_| ()));
-            //handle.spawn(Interleave::Step(pow, progressindicator).map_err(|_| ()));
             return Box::new(future::ok(resp));
         }
     }
@@ -389,7 +377,7 @@ fn powserver(req: Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Bo
 
 fn main() {
     if let Some(Ok(port)) = std::env::args().nth(1).map(|x| x.parse::<u16>()) {
-        println!("current_num_threads: {}", current_num_threads());
+        println!("current_num_threads: {}", rayon::current_num_threads());
         println!("openssl version info: {:?}", openssl::version::c_flags());
         let bindaddr = ("0.0.0.0".parse::<std::net::IpAddr>().unwrap(), port);
         /*Http::new().bind(&bindaddr.into(), || Ok(POWService)).expect("Failed to bind server")
@@ -417,7 +405,7 @@ fn main() {
 
 #[test]
 fn test_pow() {
-    println!("current_num_threads: {}", current_num_threads());
+    println!("current_num_threads: {}", rayon::current_num_threads());
     println!("POW: {:?}", proofofwork(b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\xff\xff\xff",
                                       b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x1a\x85\xbd"));
 }
