@@ -216,11 +216,9 @@ fn openssl_sys_md5(x: &[u8]) -> [u8; 32] {
 
 macro_rules! parallel_cartesian_product {
     ($f:expr, $g:expr) => { ($f)().flat_map(move |a| ($g)().map(move |b| (a,b))) };
-    ($f:expr, $g:expr, $($h:expr),+) => { {
-        let tmp = {
-            move || parallel_cartesian_product!($f, $g) };
-        parallel_cartesian_product!(tmp, $($h),+)
-    }};
+    ($f:expr, $g:expr, $($h:expr),+) => {
+        parallel_cartesian_product!(move || parallel_cartesian_product!($f, $g), $($h),+)
+    };
 }
 
 #[test]
@@ -243,18 +241,31 @@ $ python -c 'import itertools; print(list(itertools.product([0,1,2,3],[100,200])
     println!("{:?}", out2);
 }
 
-fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, inputsuffix: Option<Vec<u8>>, done: Arc<atomic::AtomicBool>, f: F) -> futures::sync::oneshot::Receiver<Option<(String, String)>> where
+enum InputType {
+    //Alphanumeric,
+    Printable,
+    U64,
+}
+
+struct InputOptions {
+    mask: Vec<u8>,
+    goal: Vec<u8>,
+    inputsuffix: Option<Vec<u8>>,
+    inputtype: InputType,
+}
+
+fn proofofwork<F>(i: InputOptions, done: Arc<atomic::AtomicBool>, f: F) -> futures::sync::oneshot::Receiver<Option<(String, String)>> where
     F: Fn(&[u8]) -> [u8; 32] + Send + Sync + 'static {
-    assert_eq!(mask.len(), goal.len());
-    assert_eq!(mask.len(), 32);
+    assert_eq!(i.mask.len(), i.goal.len());
+    assert_eq!(i.mask.len(), 32);
     let mut shift = [0; 8];
     let _ = ring::rand::SystemRandom::new().fill(&mut shift[..]);
     let shift = LittleEndian::read_u64(&shift);
     let (send, recv) = futures::sync::oneshot::channel();
     rayon::spawn_async(move || {
-        let mask = mask; let mask = &mask[..];
-        let goal = goal; let goal = &goal[..];
-        let inputsuffix = inputsuffix;
+        let mask = i.mask; let mask = &mask[..];
+        let goal = i.goal; let goal = &goal[..];
+        let inputsuffix = i.inputsuffix;
         let attempt_hash = |mut x: Vec<u8>| {
             if let Some(ref suffix) = inputsuffix {
                 x.extend_from_slice(suffix);
@@ -278,12 +289,26 @@ fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, inputsuffix: Option<Vec<u8>>, do
             let (a,b,c,d,e) = (f(), f(), f(), f(), f());
             parallel_cartesian_product!(a,b,c,d,e).map(|((((a,b),c),d),e)| vec![a,b,c,d,e])
         };
-        let result = printable5space
-            .map(attempt_hash) // calculate the hashes
-            .find_any(|x| (x.is_some() || done.load(atomic::Ordering::Relaxed))) // abort early if we're done (i.e. client cancelled)
-            .and_then(|x| x); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
-        done.store(true, atomic::Ordering::Relaxed);
-        let _ = send.send(result);
+        // duplication because ParallelIterators can't be traitobjected
+        // TODO: generic continuation function?
+        match i.inputtype {
+            InputType::Printable => {
+                let result = printable5space
+                    .map(attempt_hash) // calculate the hashes
+                    .find_any(|x| (x.is_some() || done.load(atomic::Ordering::Relaxed))) // abort early if we're done (i.e. client cancelled)
+                    .and_then(|x| x); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
+                done.store(true, atomic::Ordering::Relaxed);
+                let _ = send.send(result);
+            },
+            InputType::U64 => {
+                let result = u64space
+                    .map(attempt_hash) // calculate the hashes
+                    .find_any(|x| (x.is_some() || done.load(atomic::Ordering::Relaxed))) // abort early if we're done (i.e. client cancelled)
+                    .and_then(|x| x); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
+                done.store(true, atomic::Ordering::Relaxed);
+                let _ = send.send(result);
+            },
+        }
     });
     recv
 }
@@ -381,6 +406,7 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
         let mut mask = None;
         let mut goal = None;
         let mut inputsuffix = None;
+        let mut inputtype = InputType::U64;
         for (k, v) in url.query_pairs() {
             if k == "mask" && v.len() == 32*2 {
                 mask = v.from_hex().ok();
@@ -390,6 +416,9 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
             }
             if k == "inputsuffix" {
                 inputsuffix = v.from_hex().ok();
+            }
+            if k == "printable" {
+                inputtype = InputType::Printable;
             }
         }
         println!("mask: {:?}\ngoal: {:?}", mask.clone().map(|x| x.to_hex()), goal.clone().map(|x| x.to_hex()));
@@ -420,7 +449,12 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
                 })
             };
             let beginning = send.send(Ok("{\"progressbar\":\"".into()).into()).map_err(to_hyper_error);
-            let pow = proofofwork(mask, goal, inputsuffix, done.clone(), f).map_err(to_hyper_error);
+            let inputoptions = InputOptions {
+                mask: mask, goal: goal,
+                inputsuffix: inputsuffix,
+                inputtype: inputtype,
+            };
+            let pow = proofofwork(inputoptions, done.clone(), f).map_err(to_hyper_error);
             let pow = beginning.join(pow).and_then(move |(send, opt)| {
                 if let Some((x, hash)) = opt {
                     println!("sending preimage {}", x);
