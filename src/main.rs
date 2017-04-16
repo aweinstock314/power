@@ -183,7 +183,7 @@ sys     0m0.008s
 }
 #[allow(dead_code)]
 #[inline(always)]
-fn ring_sha256(x: [u8; 8]) -> [u8; 32] {
+fn ring_sha256(x: &[u8]) -> [u8; 32] {
 /*
 $ time curl localhost:3000/sha256?mask=$(python -c 'print "00"*29+"ff"*3')\&goal=$(python -c 'print "00"*29+"deadbe"')
 159a360000000000 has hash 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe
@@ -194,12 +194,12 @@ sys     0m0.008s
 */
     use ring::digest;
     let mut output = [0; 32];
-    output.copy_from_slice(&digest::digest(&digest::SHA256, &x).as_ref()[0..32]);
+    output.copy_from_slice(&digest::digest(&digest::SHA256, x).as_ref()[0..32]);
     output
 }
 #[allow(dead_code)]
 #[inline(always)]
-fn openssl_sys_md5(x: [u8; 8]) -> [u8; 32] {
+fn openssl_sys_md5(x: &[u8]) -> [u8; 32] {
     let mut output = [0; 32];
     thread_local!(static INIT: () = openssl_sys::init());
     thread_local!(static MD: *const openssl_sys::EVP_MD = unsafe { openssl_sys::EVP_md5() });
@@ -214,8 +214,8 @@ fn openssl_sys_md5(x: [u8; 8]) -> [u8; 32] {
     output
 }
 
-fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f: F) -> futures::sync::oneshot::Receiver<Option<(String, String)>> where
-    F: Fn([u8; 8]) -> [u8; 32] + Send + Sync + 'static {
+fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, inputsuffix: Option<Vec<u8>>, done: Arc<atomic::AtomicBool>, f: F) -> futures::sync::oneshot::Receiver<Option<(String, String)>> where
+    F: Fn(&[u8]) -> [u8; 32] + Send + Sync + 'static {
     assert_eq!(mask.len(), goal.len());
     assert_eq!(mask.len(), 32);
     let mut shift = [0; 8];
@@ -223,19 +223,21 @@ fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f
     let shift = LittleEndian::read_u64(&shift);
     let (send, recv) = futures::sync::oneshot::channel();
     rayon::spawn_async(move || {
-        let mask = mask;
-        let mask = &mask[..];
-        let goal = goal;
-        let goal = &goal[..];
+        let mask = mask; let mask = &mask[..];
+        let goal = goal; let goal = &goal[..];
+        let inputsuffix = inputsuffix;
         let attempt_hash = |x: u64| {
-            let mut tmpinput = [0; 8];
-            LittleEndian::write_u64(&mut tmpinput, x);
+            let mut tmpinput = vec![0; 8];
+            if let Some(ref suffix) = inputsuffix {
+                tmpinput.extend_from_slice(suffix);
+            }
+            LittleEndian::write_u64(&mut tmpinput[0..8], x);
             // TODO: efficient alphanumeric hashes
             //if !tmpinput.iter().all(|&c| (c as char).is_alphanumeric()) { return None; }
-            let tmpoutput = f(tmpinput);
+            let tmpoutput = f(&tmpinput);
             if mask.iter().zip(goal).zip(tmpoutput.iter()).all(|((m, g), o)| (m & o) == (m & g)) {
                 //return Some((std::str::from_utf8(&tmpinput).unwrap().into(), hasher.result_str()));
-                return Some((tmpinput.to_hex(), f(tmpinput).to_hex()));
+                return Some((tmpinput.to_hex(), f(&tmpinput).to_hex()));
             }
             None
         };
@@ -335,19 +337,23 @@ impl<F,S,T,E> Future for Interleave<F, S> where
 }*/
 
 fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f: F) -> Box<Future<Item=Response, Error=hyper::Error>> where
-    F: Fn([u8; 8]) -> [u8; 32] + Send + Sync + 'static {
+    F: Fn(&[u8]) -> [u8; 32] + Send + Sync + 'static {
     let base_url = Url::parse("http://foo").unwrap();
     println!("{:?}", req.uri());
     println!("{:?}", req.headers());
     if let Ok(url) = Url::options().base_url(Some(&base_url)).parse(req.uri().as_ref()) {
         let mut mask = None;
         let mut goal = None;
+        let mut inputsuffix = None;
         for (k, v) in url.query_pairs() {
             if k == "mask" && v.len() == 32*2 {
                 mask = v.from_hex().ok();
             }
             if k == "goal" && v.len() == 32*2 {
                 goal = v.from_hex().ok();
+            }
+            if k == "inputsuffix" {
+                inputsuffix = v.from_hex().ok();
             }
         }
         println!("mask: {:?}\ngoal: {:?}", mask.clone().map(|x| x.to_hex()), goal.clone().map(|x| x.to_hex()));
@@ -378,7 +384,7 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
                 })
             };
             let beginning = send.send(Ok("{\"progressbar\":\"".into()).into()).map_err(to_hyper_error);
-            let pow = proofofwork(mask, goal, done.clone(), f).map_err(to_hyper_error);
+            let pow = proofofwork(mask, goal, inputsuffix, done.clone(), f).map_err(to_hyper_error);
             let pow = beginning.join(pow).and_then(move |(send, opt)| {
                 if let Some((x, hash)) = opt {
                     println!("sending preimage {}", x);
