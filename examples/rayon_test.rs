@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #![feature(test)]
 extern crate futures;
 extern crate rayon;
