@@ -197,6 +197,22 @@ sys     0m0.008s
     output.copy_from_slice(&digest::digest(&digest::SHA256, &x).as_ref()[0..32]);
     output
 }
+#[allow(dead_code)]
+#[inline(always)]
+fn openssl_sys_md5(x: [u8; 8]) -> [u8; 32] {
+    let mut output = [0; 32];
+    thread_local!(static INIT: () = openssl_sys::init());
+    thread_local!(static MD: *const openssl_sys::EVP_MD = unsafe { openssl_sys::EVP_md5() });
+    thread_local!(static CTX: *mut openssl_sys::EVP_MD_CTX = unsafe { openssl_sys::EVP_MD_CTX_create() }); // TODO: RAII wrapper
+    unsafe {
+        INIT.with(|&()| { MD.with(|&md| { CTX.with(|&ctx| {
+            openssl_sys::EVP_DigestInit_ex(ctx, md, ptr::null_mut());
+            openssl_sys::EVP_DigestUpdate(ctx, x.as_ptr() as *const _, x.len());
+            openssl_sys::EVP_DigestFinal(ctx, output.as_mut_ptr() as *mut _, ptr::null_mut());
+        })})});
+    }
+    output
+}
 
 fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, done: Arc<atomic::AtomicBool>, f: F) -> futures::sync::oneshot::Receiver<Option<(String, String)>> where
     F: Fn([u8; 8]) -> [u8; 32] + Send + Sync + 'static {
@@ -266,7 +282,8 @@ impl Service for POWService {
             _ => return Box::new(future::ok(Response::new().with_status(StatusCode::NotFound))),
         }
         match req.path() {
-            "/sha256" => { powserver(&req, self.0.clone(), &self.1) }
+            "/sha256" => { powserver(&req, self.0.clone(), &self.1, ring_sha256) }
+            "/md5" => { powserver(&req, self.0.clone(), &self.1, openssl_sys_md5) }
             _ => Box::new(future::ok(Response::new().with_body(HELP_MSG.as_bytes())))
         }
     }
@@ -317,7 +334,8 @@ impl<F,S,T,E> Future for Interleave<F, S> where
     }
 }*/
 
-fn powserver(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> Box<Future<Item=Response, Error=hyper::Error>> {
+fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f: F) -> Box<Future<Item=Response, Error=hyper::Error>> where
+    F: Fn([u8; 8]) -> [u8; 32] + Send + Sync + 'static {
     let base_url = Url::parse("http://foo").unwrap();
     println!("{:?}", req.uri());
     println!("{:?}", req.headers());
@@ -360,7 +378,7 @@ fn powserver(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle) -> B
                 })
             };
             let beginning = send.send(Ok("{\"progressbar\":\"".into()).into()).map_err(to_hyper_error);
-            let pow = proofofwork(mask, goal, done.clone(), ring_sha256).map_err(to_hyper_error);
+            let pow = proofofwork(mask, goal, done.clone(), f).map_err(to_hyper_error);
             let pow = beginning.join(pow).and_then(move |(send, opt)| {
                 if let Some((x, hash)) = opt {
                     println!("sending preimage {}", x);
