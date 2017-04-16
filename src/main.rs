@@ -214,6 +214,35 @@ fn openssl_sys_md5(x: &[u8]) -> [u8; 32] {
     output
 }
 
+macro_rules! parallel_cartesian_product {
+    ($f:expr, $g:expr) => { ($f)().flat_map(move |a| ($g)().map(move |b| (a,b))) };
+    ($f:expr, $g:expr, $($h:expr),+) => { {
+        let tmp = {
+            move || parallel_cartesian_product!($f, $g) };
+        parallel_cartesian_product!(tmp, $($h),+)
+    }};
+}
+
+#[test]
+fn test_product() {
+/*
+$ python -c 'import itertools; print(list(itertools.product([0,1,2,3],[100,200])))'
+[(0, 100), (0, 200), (1, 100), (1, 200), (2, 100), (2, 200), (3, 100), (3, 200)]
+*/
+    let f = || vec![0,1,2,3].into_par_iter();
+    let g = || vec![100,200].into_par_iter();
+    let out1 = parallel_cartesian_product!(f,g).collect::<Vec<(u8, u8)>>();
+    assert_eq!(out1, vec![(0, 100), (0, 200), (1, 100), (1, 200), (2, 100), (2, 200), (3, 100), (3, 200)]);
+    println!("{:?}", out1);
+
+    let genh = || || b"\x00\x01".into_par_iter().cloned();
+    let (h1, h2, h3) = (genh(), genh(), genh());
+    let out2 = parallel_cartesian_product!(h1, h2, h3).collect::<Vec<((u8, u8), u8)>>();
+    let out2 = out2.into_iter().map(|((x, y),z)| vec![x,y,z]).collect::<Vec<Vec<u8>>>();
+    assert_eq!(out2, vec![[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1], [1, 0, 0], [1, 0, 1], [1, 1, 0], [1, 1, 1]]);
+    println!("{:?}", out2);
+}
+
 fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, inputsuffix: Option<Vec<u8>>, done: Arc<atomic::AtomicBool>, f: F) -> futures::sync::oneshot::Receiver<Option<(String, String)>> where
     F: Fn(&[u8]) -> [u8; 32] + Send + Sync + 'static {
     assert_eq!(mask.len(), goal.len());
@@ -226,23 +255,30 @@ fn proofofwork<F>(mask: Vec<u8>, goal: Vec<u8>, inputsuffix: Option<Vec<u8>>, do
         let mask = mask; let mask = &mask[..];
         let goal = goal; let goal = &goal[..];
         let inputsuffix = inputsuffix;
-        let attempt_hash = |x: u64| {
-            let mut tmpinput = vec![0; 8];
+        let attempt_hash = |mut x: Vec<u8>| {
             if let Some(ref suffix) = inputsuffix {
-                tmpinput.extend_from_slice(suffix);
+                x.extend_from_slice(suffix);
             }
-            LittleEndian::write_u64(&mut tmpinput[0..8], x);
             // TODO: efficient alphanumeric hashes
             //if !tmpinput.iter().all(|&c| (c as char).is_alphanumeric()) { return None; }
-            let tmpoutput = f(&tmpinput);
+            let tmpoutput = f(&x);
             if mask.iter().zip(goal).zip(tmpoutput.iter()).all(|((m, g), o)| (m & o) == (m & g)) {
-                //return Some((std::str::from_utf8(&tmpinput).unwrap().into(), hasher.result_str()));
-                return Some((tmpinput.to_hex(), f(&tmpinput).to_hex()));
+                //return Some((std::str::from_utf8(&x).unwrap().into(), hasher.result_str()));
+                return Some((x.to_hex(), f(&x).to_hex()));
             }
             None
         };
-        let result = (0..(0u64.wrapping_sub(1))).into_par_iter() // Brute force over a 64-bit input space
+        let u64space = (0..(0u64.wrapping_sub(1))).into_par_iter() // Brute force over a 64-bit input space
             .map(|x| x.wrapping_add(shift)) // Randomize the starting space
+            .map(|x| { let mut tmpinput = vec![0; 8]; LittleEndian::write_u64(&mut tmpinput[0..8], x); tmpinput });
+
+        let printable5space = {
+            // TODO: randomization
+            let f = || || (b' '..b'~'+1).into_par_iter(); // printable chars
+            let (a,b,c,d,e) = (f(), f(), f(), f(), f());
+            parallel_cartesian_product!(a,b,c,d,e).map(|((((a,b),c),d),e)| vec![a,b,c,d,e])
+        };
+        let result = printable5space
             .map(attempt_hash) // calculate the hashes
             .find_any(|x| (x.is_some() || done.load(atomic::Ordering::Relaxed))) // abort early if we're done (i.e. client cancelled)
             .and_then(|x| x); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
@@ -431,6 +467,9 @@ fn main() {
 #[test]
 fn test_pow() {
     println!("current_num_threads: {}", rayon::current_num_threads());
-    println!("POW: {:?}", proofofwork(b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\xff\xff\xff",
-                                      b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x1a\x85\xbd"));
+    println!("POW: {:?}", proofofwork(b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\xff\xff\xff".to_vec(),
+                                      b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x1a\x85\xbd".to_vec(),
+                                      None,
+                                      Arc::new(atomic::AtomicBool::new(false)),
+                                      ring_sha256).wait());
 }
