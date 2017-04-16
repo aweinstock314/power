@@ -242,7 +242,7 @@ $ python -c 'import itertools; print(list(itertools.product([0,1,2,3],[100,200])
 }
 
 enum InputType {
-    //Alphanumeric,
+    Alphanumeric,
     Printable,
     U64,
 }
@@ -289,9 +289,23 @@ fn proofofwork<F>(i: InputOptions, done: Arc<atomic::AtomicBool>, f: F) -> futur
             let (a,b,c,d,e) = (f(), f(), f(), f(), f());
             parallel_cartesian_product!(a,b,c,d,e).map(|((((a,b),c),d),e)| vec![a,b,c,d,e])
         };
+        let alphanumeric5space = {
+            // TODO: randomization
+            let f = || || (b'0'..b'Z'+1).into_par_iter().chain((b'a'..b'z'+1).into_par_iter()); // alphanumeric chars
+            let (a,b,c,d,e) = (f(), f(), f(), f(), f());
+            parallel_cartesian_product!(a,b,c,d,e).map(|((((a,b),c),d),e)| vec![a,b,c,d,e])
+        };
         // duplication because ParallelIterators can't be traitobjected
         // TODO: generic continuation function?
         match i.inputtype {
+            InputType::Alphanumeric => {
+                let result = alphanumeric5space
+                    .map(attempt_hash) // calculate the hashes
+                    .find_any(|x| (x.is_some() || done.load(atomic::Ordering::Relaxed))) // abort early if we're done (i.e. client cancelled)
+                    .and_then(|x| x); // ignore the difference between finding no matching hashes and aborting early (`bind id` == `join`)
+                done.store(true, atomic::Ordering::Relaxed);
+                let _ = send.send(result);
+            },
             InputType::Printable => {
                 let result = printable5space
                     .map(attempt_hash) // calculate the hashes
@@ -419,6 +433,9 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
             }
             if k == "printable" {
                 inputtype = InputType::Printable;
+            }
+            if k == "alphanumeric" {
+                inputtype = InputType::Alphanumeric;
             }
         }
         println!("mask: {:?}\ngoal: {:?}", mask.clone().map(|x| x.to_hex()), goal.clone().map(|x| x.to_hex()));
