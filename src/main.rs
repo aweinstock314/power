@@ -157,30 +157,30 @@ sys     0m0.016s
     output.copy_from_slice(&hash(MessageDigest::sha256(), &x).unwrap()[0..32]);
     output
 }
-#[allow(dead_code)]
-#[inline(always)]
-fn openssl_sys_sha256(x: [u8; 8]) -> [u8; 32] {
-/*
-$ time curl localhost:3000/sha256?mask=$(python -c 'print "00"*29+"ff"*3')\&goal=$(python -c 'print "00"*29+"deadbe"')
-159a360000000000 has hash 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe
-
-real    0m3.427s
-user    0m0.040s
-sys     0m0.008s
-*/
-    let mut output = [0; 32];
-    thread_local!(static INIT: () = openssl_sys::init());
-    thread_local!(static MD: *const openssl_sys::EVP_MD = unsafe { openssl_sys::EVP_sha256() });
-    thread_local!(static CTX: *mut openssl_sys::EVP_MD_CTX = unsafe { openssl_sys::EVP_MD_CTX_create() }); // TODO: RAII wrapper
-    unsafe {
-        INIT.with(|&()| { MD.with(|&md| { CTX.with(|&ctx| {
-            openssl_sys::EVP_DigestInit_ex(ctx, md, ptr::null_mut());
-            openssl_sys::EVP_DigestUpdate(ctx, x.as_ptr() as *const _, x.len());
-            openssl_sys::EVP_DigestFinal(ctx, output.as_mut_ptr() as *mut _, ptr::null_mut());
-        })})});
+macro_rules! define_openssl_sys_evp_hash {
+    ($name:ident, $initializer:expr, $hashsize:expr) => {
+        #[allow(dead_code)]
+        #[inline(always)]
+        fn $name (x: &[u8]) -> [u8; $hashsize] {
+            let mut output = [0; $hashsize];
+            thread_local!(static INIT: () = openssl_sys::init());
+            thread_local!(static MD: *const openssl_sys::EVP_MD = unsafe { $initializer });
+            thread_local!(static CTX: *mut openssl_sys::EVP_MD_CTX = unsafe { openssl_sys::EVP_MD_CTX_create() }); // TODO: RAII wrapper
+            unsafe {
+                INIT.with(|&()| { MD.with(|&md| { CTX.with(|&ctx| {
+                    openssl_sys::EVP_DigestInit_ex(ctx, md, ptr::null_mut());
+                    openssl_sys::EVP_DigestUpdate(ctx, x.as_ptr() as *const _, x.len());
+                    openssl_sys::EVP_DigestFinal(ctx, output.as_mut_ptr() as *mut _, ptr::null_mut());
+                })})});
+            }
+            output
+        }
     }
-    output
 }
+define_openssl_sys_evp_hash!(openssl_sys_sha1, openssl_sys::EVP_sha1(), 32);
+define_openssl_sys_evp_hash!(openssl_sys_sha256, openssl_sys::EVP_sha256(), 32);
+define_openssl_sys_evp_hash!(openssl_sys_md5, openssl_sys::EVP_md5(), 32);
+
 #[allow(dead_code)]
 #[inline(always)]
 fn ring_sha256(x: &[u8]) -> [u8; 32] {
@@ -195,22 +195,6 @@ sys     0m0.008s
     use ring::digest;
     let mut output = [0; 32];
     output.copy_from_slice(&digest::digest(&digest::SHA256, x).as_ref()[0..32]);
-    output
-}
-#[allow(dead_code)]
-#[inline(always)]
-fn openssl_sys_md5(x: &[u8]) -> [u8; 32] {
-    let mut output = [0; 32];
-    thread_local!(static INIT: () = openssl_sys::init());
-    thread_local!(static MD: *const openssl_sys::EVP_MD = unsafe { openssl_sys::EVP_md5() });
-    thread_local!(static CTX: *mut openssl_sys::EVP_MD_CTX = unsafe { openssl_sys::EVP_MD_CTX_create() }); // TODO: RAII wrapper
-    unsafe {
-        INIT.with(|&()| { MD.with(|&md| { CTX.with(|&ctx| {
-            openssl_sys::EVP_DigestInit_ex(ctx, md, ptr::null_mut());
-            openssl_sys::EVP_DigestUpdate(ctx, x.as_ptr() as *const _, x.len());
-            openssl_sys::EVP_DigestFinal(ctx, output.as_mut_ptr() as *mut _, ptr::null_mut());
-        })})});
-    }
     output
 }
 
@@ -359,6 +343,7 @@ impl Service for POWService {
             _ => return Box::new(future::ok(Response::new().with_status(StatusCode::NotFound))),
         }
         match req.path() {
+            "/sha1" => { powserver(&req, self.0.clone(), &self.1, openssl_sys_sha1) }
             "/sha256" => { powserver(&req, self.0.clone(), &self.1, ring_sha256) }
             "/md5" => { powserver(&req, self.0.clone(), &self.1, openssl_sys_md5) }
             _ => Box::new(future::ok(Response::new().with_body(HELP_MSG.as_bytes())))
