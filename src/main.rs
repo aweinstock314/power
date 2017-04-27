@@ -12,6 +12,7 @@ extern crate tokio_core;
 extern crate tokio_io;
 extern crate tokio_proto;
 extern crate url;
+extern crate clap;
 
 use byteorder::{ByteOrder, LittleEndian};
 use crypto::digest::Digest;
@@ -28,6 +29,7 @@ use tokio_core::net::TcpListener;
 use tokio_core::reactor::{Core, Handle, Timeout};
 use tokio_io::{AsyncRead, AsyncWrite};
 use url::Url;
+use clap::{Arg, App};
 
 fn detect_hup<I: AsyncRead + AsyncWrite>(io: I) -> (DetectHUP<I>, futures::sync::oneshot::Receiver<()>) {
     let (sender, receiver) = futures::sync::oneshot::channel();
@@ -473,7 +475,20 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
 }
 
 fn main() {
-    if let Some(Ok(port)) = std::env::args().nth(1).map(|x| x.parse::<u16>()) {
+    let matches = App::new("POWer")
+            .arg(Arg::with_name("port")
+                    .short("p")
+                    .long("port")
+                    .takes_value(true))
+            .arg(Arg::with_name("num_threads")
+                    .short("t")
+                    .long("num_threads")
+                    .takes_value(true))
+            .get_matches();
+    if let Some(num_threads) = matches.value_of("num_threads").and_then(|x| x.parse().ok()) {
+        rayon::initialize(rayon::Configuration::new().num_threads(num_threads)).unwrap();
+    }
+    if let Ok(port) = matches.value_of("port").unwrap_or("8080").parse::<u16>() {
         println!("current_num_threads: {}", rayon::current_num_threads());
         println!("openssl version info: {:?}", openssl::version::c_flags());
         let bindaddr = ("0.0.0.0".parse::<std::net::IpAddr>().unwrap(), port);
@@ -495,8 +510,6 @@ fn main() {
             }).map_err(|_| ()));
             Ok(())
         })).unwrap();
-    } else {
-        println!("Expecting the port as the first argument.");
     }
 }
 
