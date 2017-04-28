@@ -19,7 +19,7 @@ u'c72b530200000040 has hash 00abcdef83801fd557e1740187560ac4fdc557645e175f5faeb4
 
 - Pre-randomization:
 ```
-$ time curl localhost:3000/sha256?mask=$(python -c 'print \"0fff\"+\"00\"*28+\"ff\"*2')\\&goal=$(python -c 'print \"dead\"+\"00\"*28+\"beef\"')
+$ time curl localhost:3000/sha256?mask=$(python -c 'print "0fff"+"00"*28+"ff"*2')\&goal=$(python -c 'print "dead"+"00"*28+"beef"')
 ee00ad0000000060 has hash 2eadd4a8cf0ea220da5570e0ac7855ffc6e416e09c08e0a7b81fbac0fcaabeef
 
 real    0m9.760s
@@ -53,10 +53,24 @@ real    0m44.884s
 user    0m0.040s
 sys     0m0.004s
 ```
+- After new features:
+```
+$ time curl localhost:3000/sha256?mask=$(python -c 'print "0fff"+"00"*28+"ff"*2')\&goal=$(python -c 'print "dead"+"00"*28+"beef"')
+{"progressbar":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "preimage_hex":"2db323d3eb4c79ad", "image_hex":"5ead5c4c0062a244941971c6a9d0da247185e7584d94bc4c784f0395da79beef"}
+real    0m55.687s
+user    0m0.040s
+sys     0m0.016s
+```
+
+## Features
+- Currently supports SHA1, SHA256, and MD5
+- `?inputsuffix=foo` to control the input to the hash
+- `?printable` and `?alphanumeric` for getting printable and alphanumeric preimages, respectively
 
 ## TODOs
-- Alphanumeric only keyspace
-- All the other hash functions that rust-crypto can use
+- Fix perf regressions from supporting printable/alphanumeric
+- Add derandomized option for deterministic benchmarks
+- Randomized alphanumeric/printable keyspaces
+- Get HUP detection working with requests (already works with curl/netcat)
+- More hash functions? (generalize length)
 - GPU acceleration
-- Double-check whether concurrent requests work properly (i.e. whether hyper's handler blocks while rayon is bruting hashes), look into futures integration if negative
-

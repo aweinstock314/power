@@ -44,7 +44,7 @@ impl<I> DetectHUP<I> {
         //println!("{:?}", x);
         if let Err(ref e) = x {
             println!("e.kind {:?}", e.kind());
-            if e.kind() == io::ErrorKind::BrokenPipe {
+            if e.kind() == io::ErrorKind::BrokenPipe || e.kind() == io::ErrorKind::ConnectionReset {
                 let _ = self.sender.take().map(|sender| sender.send(()));
             }
         }
@@ -74,57 +74,6 @@ impl<I: AsyncWrite> AsyncWrite for DetectHUP<I> {
         self.io.shutdown()
     }
 }
-
-/*struct InjectZeroLengthReads<P>(P, Duration);
-impl<B: AsRef<[u8]>+'static> InjectZeroLengthReads<Http<B>> {
-    fn bind_connection<S, I, Bd>(&self, handle: &Handle, io: I, remote_service: std::net::SocketAddr, service: S) where
-        S: Service<Request=Request, Response=Response<Bd>, Error=hyper::Error> + 'static,
-        Bd: Stream<Item=B, Error=hyper::Error> + 'static,
-        I: AsyncRead + AsyncWrite + 'static {
-        println!("IZLR bind_connection");
-        self.0.bind_connection(handle, io, remote_service, service)
-    }
-}
-impl<T: 'static, P: tokio_proto::pipeline::ServerProto<T>> tokio_proto::pipeline::ServerProto<T> for InjectZeroLengthReads<P> where
-    P::Request: std::fmt::Debug,
-    P::Response: std::fmt::Debug {
-    type Request = P::Request;
-    type Response = P::Response;
-    type Transport = IZLRTransport<T, P>;
-    type BindTransport = Box<Future<Item=Self::Transport, Error=io::Error>>;
-    fn bind_transport(&self, io: T) -> Self::BindTransport {
-        use futures::IntoFuture;
-        println!("IZLR bind_transport");
-        Box::new(self.0.bind_transport(io).into_future().map(IZLRTransport))
-    }
-}
-struct IZLRTransport<T: 'static, P: tokio_proto::pipeline::ServerProto<T>>(P::Transport);
-impl<T, P: tokio_proto::pipeline::ServerProto<T>> Stream for IZLRTransport<T, P> where
-    P::Request: std::fmt::Debug {
-    type Item = P::Request;
-    type Error = io::Error;
-    fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
-        let tmp = self.0.poll();
-        println!("IZLRTransport::poll {:?}", tmp);
-        tmp
-    }
-}
-
-impl<T, P: tokio_proto::pipeline::ServerProto<T>> Sink for IZLRTransport<T, P> where
-    P::Response: std::fmt::Debug {
-    type SinkItem = P::Response;
-    type SinkError = io::Error;
-    fn start_send(&mut self, item: Self::SinkItem) -> futures::StartSend<Self::SinkItem, Self::SinkError> {
-        let tmp = self.0.start_send(item);
-        println!("IZLRTransport::start_send {:?}", tmp);
-        tmp
-    }
-    fn poll_complete(&mut self) -> futures::Poll<(), Self::SinkError> {
-        let tmp = self.0.poll_complete();
-        println!("IZLRTransport::poll_complete {:?}", tmp);
-        tmp
-    }
-}*/
 
 #[allow(dead_code)]
 #[inline(always)]
@@ -315,22 +264,26 @@ fn proofofwork<F>(i: InputOptions, done: Arc<atomic::AtomicBool>, f: F) -> futur
 
 const HELP_MSG: &'static str = "Usage examples:
 $ time curl localhost:3000/sha256?mask=$(python -c 'print \"00\"*29+\"ff\"*3')\\&goal=$(python -c 'print \"00\"*29+\"deadbe\"')
-159a360000000000 has hash 9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe
-
-real    0m3.049s
+{\"progressbar\":\"x\", \"preimage_hex\":\"86a1958e714a6e4f\", \"image_hex\":\"b44d1a3a625d0e6e41cc082382e8fe26dcd1dfbfad12ed62e69f82b157deadbe\"}
+real    0m1.667s
 user    0m0.040s
-sys     0m0.008s
-$ python -c 'import sys; sys.stdout.write(\"159a360000000000\".decode(\"hex\"))' | sha256sum
-9d0ec7b3dd909e1d7ee64186e13b8065c32e88695c8aa938bdbb9a9c6ddeadbe  -
+sys     0m0.004s
+$ python -c 'import sys; sys.stdout.write(\"86a1958e714a6e4f\".decode(\"hex\"))' | sha256sum
+b44d1a3a625d0e6e41cc082382e8fe26dcd1dfbfad12ed62e69f82b157deadbe  -
 $ python
 >>> import requests
 >>> requests.get('http://localhost:3000/sha256', params={'mask': '00'+'ff'*3+'00'*28, 'goal': '00badc0d'+'00'*28}).text
-u'78a3170000000000 has hash fcbadc0d5856bb6eea467a236218eb5e16017a1636e335e2946618feb0aae620\\n'
->>> requests.get('http://localhost:3000/sha256', params={'mask': 'ff'*4+'00'*28, 'goal': '00abcdef'+'00'*28}).text
-u'c72b530200000040 has hash 00abcdef83801fd557e1740187560ac4fdc557645e175f5faeb407e54a2d9958\\n'
+u'{\"progressbar\":\"xx\", \"preimage_hex\":\"309aed245f7bba4b\", \"image_hex\":\"41badc0d83e07841ec957761e23405845b518a270fec555bf20d02e8aa8128e6\"}'
 
 Intended general usage (more algos will be added later):
-GET /sha256?mask=<some 32 byte hex encoded mask>&goal=<some 32 byte hex encoded goal>";
+GET /md5?mask=<some 32 byte hex encoded mask>&goal=<some 32 byte hex encoded goal>
+GET /sha1?mask=<some 32 byte hex encoded mask>&goal=<some 32 byte hex encoded goal>
+GET /sha256?mask=<some 32 byte hex encoded mask>&goal=<some 32 byte hex encoded goal>
+
+Additional options
+- `?inputsuffix=foo` to control the suffix of the preimage
+- `?printable` and `?alphanumeric` for getting printable and alphanumeric preimages, respectively
+";
 
 struct POWService(Arc<atomic::AtomicBool>, Handle);
 impl Service for POWService {
@@ -356,47 +309,6 @@ impl Service for POWService {
 fn to_hyper_error<E: std::error::Error+Send+Sync+'static>(e: E) -> hyper::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e).into()
 }
-
-/*enum Interleave<F, S> {
-    Nil,
-    Step(F, S),
-    StreamExhausted(F),
-}
-impl<F,S,T,E> Future for Interleave<F, S> where
-    T: std::fmt::Debug, E: std::fmt::Debug,
-    F: Future<Item=T, Error=E>,
-    S: Stream<Item=(), Error=E> {
-    type Item = T;
-    type Error = E;
-    fn poll(&mut self) -> futures::Poll<T, E> {
-        use futures::Async::*;
-        use Interleave::*;
-        let state = std::mem::replace(self, Nil);
-        println!("Interleave::poll({})", match state {
-            Nil => "Nil",
-            Step(_, _) => "Step",
-            StreamExhausted(_) => "StreamExhausted",
-        });
-        let tmp = match state {
-            Nil => panic!("Attempted to poll interleave while Nil"),
-            Step(mut f, mut s) => match (f.poll(), s.poll()) {
-                (Ok(Ready(t)), _) => Ok(Ready(t)),
-                (_, Ok(Ready(None))) => { *self = StreamExhausted(f); Ok(NotReady) },
-                (_, Ok(Ready(Some(())))) => { *self = Step(f, s); Ok(NotReady) },
-                (Ok(NotReady), Ok(NotReady)) => { *self = Step(f, s); Ok(NotReady) },
-                (Err(e), _) => Err(e),
-                (_, Err(e)) => Err(e),
-            },
-            StreamExhausted(mut f) => match f.poll() {
-                Ok(Ready(t)) => Ok(Ready(t)),
-                Ok(NotReady) => { *self = StreamExhausted(f); Ok(NotReady) },
-                Err(e) => Err(e),
-            },
-        };
-        println!("returning {:?}", tmp);
-        tmp
-    }
-}*/
 
 fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f: F) -> Box<Future<Item=Response, Error=hyper::Error>> where
     F: Fn(&[u8]) -> [u8; 32] + Send + Sync + 'static {
@@ -464,6 +376,7 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
                     println!("sending preimage {}", x);
                     send.send(Ok(format!("\", \"preimage_hex\":\"{}\", \"image_hex\":\"{}\"}}", x, hash).into()))
                 } else {
+                    println!("cancelled/exhausted");
                     send.send(Ok("\", \"error\":\"Cancelled or exhausted search space\"}".into()))
                 }.map(|_| ()).map_err(to_hyper_error)
             });
