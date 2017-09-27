@@ -5,16 +5,16 @@ authors = ["Avi Weinstock <aweinstock314@gmail.com>"]
 
 [dependencies]
 byteorder = "1.0.0"
+clap = "2.23"
 futures = "0.1.13"
-hyper = { git = "https://github.com/hyperium/hyper" }
+hyper = "0.11.2"
 openssl = "0.9.10"
 openssl-sys = "0.9.10"
-rayon = { version="0.7.0", features=["unstable"] }
-ring = "0.7.4"
+rayon = "0.8.2"
+ring = "0.12.1"
 rust-crypto = "0.2.36"
-rustc-serialize = "0.3"
+rustc-hex = "1.0.0"
 tokio-core = "0.1.6"
 tokio-io = "0.1.1"
 tokio-proto = "0.1.1"
 url = "1.4.0"
-clap = "2.23"

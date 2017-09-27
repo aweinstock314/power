@@ -1,5 +1,6 @@
 #![cfg_attr(feature="cargo-clippy", allow(inline_always))]
 extern crate byteorder;
+extern crate clap;
 extern crate crypto;
 extern crate futures;
 extern crate hyper;
@@ -7,29 +8,28 @@ extern crate openssl;
 extern crate openssl_sys;
 extern crate rayon;
 extern crate ring;
-extern crate rustc_serialize;
+extern crate rustc_hex;
 extern crate tokio_core;
 extern crate tokio_io;
-extern crate tokio_proto;
 extern crate url;
-extern crate clap;
 
 use byteorder::{ByteOrder, LittleEndian};
+use clap::{Arg, App};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 use futures::{Future, future, Stream, stream, Sink};
 use hyper::StatusCode;
 use hyper::server::{Service, Request, Response, Http};
 use rayon::prelude::*;
-use rustc_serialize::hex::{FromHex, ToHex};
-use std::{io, ptr};
+use ring::rand::SecureRandom;
+use rustc_hex::{FromHex, ToHex};
 use std::sync::{Arc, atomic};
 use std::time::Duration;
+use std::{io, ptr};
 use tokio_core::net::TcpListener;
 use tokio_core::reactor::{Core, Handle, Timeout};
 use tokio_io::{AsyncRead, AsyncWrite};
 use url::Url;
-use clap::{Arg, App};
 
 fn detect_hup<I: AsyncRead + AsyncWrite>(io: I) -> (DetectHUP<I>, futures::sync::oneshot::Receiver<()>) {
     let (sender, receiver) = futures::sync::oneshot::channel();
@@ -103,9 +103,9 @@ real    0m4.046s
 user    0m0.036s
 sys     0m0.016s
 */
-    use openssl::hash::{hash, MessageDigest};
+    use openssl::hash::{hash2, MessageDigest};
     let mut output = [0; 32];
-    output.copy_from_slice(&hash(MessageDigest::sha256(), &x).unwrap()[0..32]);
+    output.copy_from_slice(&hash2(MessageDigest::sha256(), &x).unwrap()[0..32]);
     output
 }
 macro_rules! define_openssl_sys_evp_hash {
@@ -197,7 +197,7 @@ fn proofofwork<F>(i: InputOptions, done: Arc<atomic::AtomicBool>, f: F) -> futur
     let _ = ring::rand::SystemRandom::new().fill(&mut shift[..]);
     let shift = LittleEndian::read_u64(&shift);
     let (send, recv) = futures::sync::oneshot::channel();
-    rayon::spawn_async(move || {
+    rayon::spawn(move || {
         let mask = i.mask; let mask = &mask[..];
         let goal = i.goal; let goal = &goal[..];
         let inputsuffix = i.inputsuffix;
