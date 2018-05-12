@@ -9,9 +9,9 @@ extern crate openssl_sys;
 extern crate rayon;
 extern crate ring;
 extern crate rustc_hex;
+extern crate serde_urlencoded;
 extern crate tokio_core;
 extern crate tokio_io;
-extern crate url;
 
 use byteorder::{ByteOrder, LittleEndian};
 use clap::{Arg, App};
@@ -23,13 +23,13 @@ use hyper::server::{Service, Request, Response, Http};
 use rayon::prelude::*;
 use ring::rand::SecureRandom;
 use rustc_hex::{FromHex, ToHex};
+use std::collections::HashMap;
 use std::sync::{Arc, atomic};
 use std::time::Duration;
 use std::{io, ptr};
 use tokio_core::net::TcpListener;
 use tokio_core::reactor::{Core, Handle, Timeout};
 use tokio_io::{AsyncRead, AsyncWrite};
-use url::Url;
 
 fn detect_hup<I: AsyncRead + AsyncWrite>(io: I) -> (DetectHUP<I>, futures::sync::oneshot::Receiver<()>) {
     let (sender, receiver) = futures::sync::oneshot::channel();
@@ -312,15 +312,16 @@ fn to_hyper_error<E: std::error::Error+Send+Sync+'static>(e: E) -> hyper::Error 
 
 fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f: F) -> Box<Future<Item=Response, Error=hyper::Error>> where
     F: Fn(&[u8]) -> [u8; 32] + Send + Sync + 'static {
-    let base_url = Url::parse("http://foo").unwrap();
-    println!("{:?}", req.uri());
-    println!("{:?}", req.headers());
-    if let Ok(url) = Url::options().base_url(Some(&base_url)).parse(req.uri().as_ref()) {
+    //let base_url = Url::parse("http://foo").unwrap();
+    println!("{:?}", (req.path(), req.query(), req.headers()));
+    //if let Ok(url) = Url::options().base_url(Some(&base_url)).parse(req.uri().as_ref()) {
+    let query_pairs: Option<HashMap<String, String>> = req.query().and_then(|q| serde_urlencoded::from_str(q).ok());
+    if let Some(query_pairs) = query_pairs {
         let mut mask = None;
         let mut goal = None;
         let mut inputsuffix = None;
         let mut inputtype = InputType::U64;
-        for (k, v) in url.query_pairs() {
+        for (k, v) in query_pairs {
             if k == "mask" && v.len() == 32*2 {
                 mask = v.from_hex().ok();
             }
