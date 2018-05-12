@@ -6,6 +6,10 @@ Intended to be set up by individual teams
 
 Currently has no authentication/DoS mitigation (it's supposed to heat up the CPU of the server it's running on)
 
+## Running a local copy
+
+Clone this repo, then run `cargo run --release`
+
 ## Usage from Python
 ```
 >>> import requests
