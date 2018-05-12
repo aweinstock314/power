@@ -185,6 +185,7 @@ enum InputType {
 struct InputOptions {
     mask: Vec<u8>,
     goal: Vec<u8>,
+    inputprefix: Option<Vec<u8>>,
     inputsuffix: Option<Vec<u8>>,
     inputtype: InputType,
 }
@@ -200,8 +201,14 @@ fn proofofwork<F>(i: InputOptions, done: Arc<atomic::AtomicBool>, f: F) -> futur
     rayon::spawn(move || {
         let mask = i.mask; let mask = &mask[..];
         let goal = i.goal; let goal = &goal[..];
+        let inputprefix = i.inputprefix;
         let inputsuffix = i.inputsuffix;
         let attempt_hash = |mut x: Vec<u8>| {
+            if let Some(ref prefix) = inputprefix {
+                for b in prefix.iter().rev() {
+                    x.insert(0, *b);
+                }
+            }
             if let Some(ref suffix) = inputsuffix {
                 x.extend_from_slice(suffix);
             }
@@ -319,6 +326,7 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
     if let Some(query_pairs) = query_pairs {
         let mut mask = None;
         let mut goal = None;
+        let mut inputprefix = None;
         let mut inputsuffix = None;
         let mut inputtype = InputType::U64;
         for (k, v) in query_pairs {
@@ -327,6 +335,9 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
             }
             if k == "goal" && v.len() == 32*2 {
                 goal = v.from_hex().ok();
+            }
+            if k == "inputprefix" {
+                inputprefix = v.from_hex().ok();
             }
             if k == "inputsuffix" {
                 inputsuffix = v.from_hex().ok();
@@ -368,6 +379,7 @@ fn powserver<F>(req: &Request, done: Arc<atomic::AtomicBool>, handle: &Handle, f
             let beginning = send.send(Ok("{\"progressbar\":\"".into()).into()).map_err(to_hyper_error);
             let inputoptions = InputOptions {
                 mask: mask, goal: goal,
+                inputprefix: inputprefix,
                 inputsuffix: inputsuffix,
                 inputtype: inputtype,
             };
